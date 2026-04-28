@@ -4,7 +4,7 @@ import glob
 import base64
 import requests
 import time
-from PIL import Image
+from PIL import Image #ensure you've installed Pillow (pip install Pillow)
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -102,7 +102,7 @@ def upload_to_drive(service, local_path, filename):
     print(f"  Uploaded to Drive: {uploaded['name']}")
     return uploaded
 
-def is_black_and_white(image_path, saturation_threshold=25):
+def is_black_and_white(image_path, saturation_threshold=15):
     """Detect if an image is black and white by checking average color saturation."""
     img = Image.open(image_path).convert('RGB')
     # Sample pixels to check saturation (resize for speed)
