@@ -1,0 +1,27 @@
+# Credentials and OAuth tokens - never commit these
+*.json
+!package.json
+
+# Log files
+*.log
+
+# Helper and test scripts
+test_drive.py
+
+# macOS
+.DS_Store
+
+# Python virtual environment
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Local data files and tools
+Photo_Scanning_Tracker.numbers
+realesrgan/
+git-repo/
