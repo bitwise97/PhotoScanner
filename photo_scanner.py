@@ -12,7 +12,8 @@
 #                  (Found in the folder's URL: drive.google.com/drive/folders/<ID>)
 #
 # Configuration:
-#   If --folder-id is not provided, the script checks for ~/.photo-scanner-config.json:
+#   If --folder-id is not provided, the script checks for ~/.photo-scanner-config.json
+#   (in your home directory, e.g. /Users/sreynoso/.photo-scanner-config.json):
 #   { "folder_id": "<DRIVE_FOLDER_ID>" }
 #
 # Examples:
@@ -256,10 +257,12 @@ def main():
         folder_id = load_config_file()
 
     if not folder_id:
-        print("ERROR: folder_id not provided via --folder-id parameter or ~/.photo-scanner-config.json")
-        print("\nUsage:")
+        config_path = os.path.expanduser('~/.photo-scanner-config.json')
+        print("ERROR: folder_id not provided via --folder-id parameter or config file")
+        print(f"\nUsage:")
         print("  python photo_scanner.py --folder-id <DRIVE_FOLDER_ID>")
-        print("\nOr create ~/.photo-scanner-config.json with:")
+        print(f"\nOr create a config file at: {config_path}")
+        print('  with contents:')
         print('  { "folder_id": "<DRIVE_FOLDER_ID>" }')
         return
 

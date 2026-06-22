@@ -67,12 +67,13 @@ python photo_scanner.py --folder-id 1R5UhpYBe2nzZaf5T8qtAhHha76ajhRhO
 
 #### Option 2: Config file (for automated/launchctl use)
 
-Create `~/.photo-scanner-config.json`:
+Create `~/.photo-scanner-config.json` in your home directory (e.g., `/Users/sreynoso/.photo-scanner-config.json`):
 ```json
 {
   "folder_id": "1R5UhpYBe2nzZaf5T8qtAhHha76ajhRhO"
 }
 ```
+(The `~` symbol represents your home directory.)
 
 Then run the script with no parameters:
 ```bash
