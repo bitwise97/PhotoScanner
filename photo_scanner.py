@@ -5,14 +5,19 @@
 # version alongside the color-enhanced version, using the Pillow image library.
 #
 # Usage:
-#   python photo_scanner.py --folder-id <DRIVE_FOLDER_ID>
+#   python photo_scanner.py [--folder-id <DRIVE_FOLDER_ID>]
 #
-# Required parameters:
+# Parameters (optional):
 #   --folder-id    The Google Drive folder ID for the current album.
 #                  (Found in the folder's URL: drive.google.com/drive/folders/<ID>)
 #
-# Example:
+# Configuration:
+#   If --folder-id is not provided, the script checks for ~/.photo-scanner-config.json:
+#   { "folder_id": "<DRIVE_FOLDER_ID>" }
+#
+# Examples:
 #   python photo_scanner.py --folder-id 1R5UhpYBe2nzZaf5T8qtAhHha76ajhRhO
+#   python photo_scanner.py  # reads folder_id from ~/.photo-scanner-config.json
 #
 # Prerequisites:
 #   - launchctl must be configured to monitor ~/Pictures and trigger this script
@@ -25,6 +30,7 @@
 #     re-authorize automatically via browser rather than failing.
 
 import argparse
+import json
 import os
 import re
 import glob
@@ -219,14 +225,43 @@ def enhance_with_xai(input_path, output_path):
 
 
 # ============================================================
+# CONFIG HANDLING
+# ============================================================
+
+def load_config_file():
+    """Load folder ID from config file if it exists."""
+    config_path = os.path.expanduser('~/.photo-scanner-config.json')
+    if not os.path.exists(config_path):
+        return None
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+            return config.get('folder_id')
+    except Exception as e:
+        print(f"WARNING: Could not read config file {config_path}: {e}")
+        return None
+
+# ============================================================
 # MAIN PIPELINE
 # ============================================================
 
 def main():
     parser = argparse.ArgumentParser(description='Scan, enhance, and upload photos to Google Drive.')
-    parser.add_argument('--folder-id', required=True, help='Google Drive folder ID for the current album')
+    parser.add_argument('--folder-id', required=False, help='Google Drive folder ID for the current album')
     args = parser.parse_args()
+
+    # Use CLI parameter if provided, otherwise try config file
     folder_id = args.folder_id
+    if not folder_id:
+        folder_id = load_config_file()
+
+    if not folder_id:
+        print("ERROR: folder_id not provided via --folder-id parameter or ~/.photo-scanner-config.json")
+        print("\nUsage:")
+        print("  python photo_scanner.py --folder-id <DRIVE_FOLDER_ID>")
+        print("\nOr create ~/.photo-scanner-config.json with:")
+        print('  { "folder_id": "<DRIVE_FOLDER_ID>" }')
+        return
 
     # Step 1: Find scanner output files
     pattern = os.path.join(SCANNER_OUTPUT, 'IMG_*.jpg') 

@@ -42,7 +42,9 @@ pip install Pillow google-auth google-auth-oauthlib google-auth-httplib2 google-
    ```bash
    export XAI_API_KEY=your_api_key_here
    ```
-4. Configure launchctl to monitor `~/Pictures` and automatically trigger the script when new scanned files appear.
+4. Create `~/.photo-scanner-config.json` with your Google Drive folder ID (see Usage section for details).
+5. Configure launchctl to monitor `~/Pictures` and automatically trigger the script when new scanned files appear.
+   The launchctl plist should run: `python /path/to/photo_scanner.py` (no parameters needed — it reads from the config file).
 
 On first run, a browser window will open to authorize Google Drive access. The token is saved locally and refreshed automatically. If the token expires (e.g. after 7 days in test mode), the script will open the browser to re-authorize rather than failing.
 
@@ -54,17 +56,30 @@ Place scanned photos in `~/Pictures`, then run:
 python photo_scanner.py --folder-id <DRIVE_FOLDER_ID>
 ```
 
-### Parameters
+### Configuration
 
-| Parameter | Description |
-|---|---|
-| `--folder-id` | The Google Drive folder ID for the current album (found in the folder's URL) |
+The script can be configured in two ways:
 
-### Example
-
+#### Option 1: Command-line parameter
 ```bash
 python photo_scanner.py --folder-id 1R5UhpYBe2nzZaf5T8qtAhHha76ajhRhO
 ```
+
+#### Option 2: Config file (for automated/launchctl use)
+
+Create `~/.photo-scanner-config.json`:
+```json
+{
+  "folder_id": "1R5UhpYBe2nzZaf5T8qtAhHha76ajhRhO"
+}
+```
+
+Then run the script with no parameters:
+```bash
+python photo_scanner.py
+```
+
+If both are provided, the command-line parameter takes precedence.
 
 The script processes all `IMG_*.jpg` files it finds, uploads them to Drive, and deletes the local copies upon success. Files where AI enhancement fails are kept locally and not uploaded.
 
