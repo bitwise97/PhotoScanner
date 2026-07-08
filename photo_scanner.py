@@ -68,7 +68,7 @@ SCANNER_OUTPUT = '/Users/sreynoso/Pictures'
 
 # Topaz API key — set as an environment variable: export TOPAZ_API_KEY=your_key_here
 # Obtain your API key from https://developer.topazlabs.com
-TOPAZ_API_KEY = os.environ.get('TOPAZ_API_KEY', 'YOUR_TOPAZ_API_KEY_HERE')
+TOPAZ_API_KEY = os.environ.get('TOPAZ_API_KEY')
 
 # xAI API key — only used when a file is prefixed with 'xAI_' to trigger xAI fallback
 XAI_API_KEY = os.environ.get('XAI_API_KEY')
