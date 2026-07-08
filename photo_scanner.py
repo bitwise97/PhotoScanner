@@ -256,6 +256,7 @@ def enhance_with_topaz(input_path, output_path):
     topaz_download_url = 'https://api.topazlabs.com/image/v1/download'
 
     headers = {'X-API-KEY': TOPAZ_API_KEY}
+    start_time = time.time()
 
     with open(input_path, 'rb') as f:
         response = requests.post(
@@ -311,18 +312,32 @@ def enhance_with_topaz(input_path, output_path):
         print(f"  ERROR: Topaz enhancement timed out after 10 minutes.")
         return False
 
-    # Download the enhanced image
+    elapsed = time.time() - start_time
+    print(f"  Topaz processing completed in {elapsed:.1f}s")
+
+    # Get the download URL from Topaz
     download_response = requests.get(
         f'{topaz_download_url}/{process_id}',
         headers=headers,
-        timeout=120
+        timeout=30
     )
     if download_response.status_code != 200:
-        print(f"  ERROR: Failed to download Topaz result: {download_response.status_code}")
+        print(f"  ERROR: Failed to get Topaz download URL: {download_response.status_code}")
+        return False
+
+    image_url = download_response.json().get('url')
+    if not image_url:
+        print(f"  ERROR: No URL in Topaz download response: {download_response.json()}")
+        return False
+
+    # Download the actual image from the URL
+    image_response = requests.get(image_url, timeout=120)
+    if image_response.status_code != 200:
+        print(f"  ERROR: Failed to download image from Topaz URL: {image_response.status_code}")
         return False
 
     with open(output_path, 'wb') as f:
-        f.write(download_response.content)
+        f.write(image_response.content)
 
     print(f"  Enhanced image saved: {os.path.basename(output_path)}")
     return True
