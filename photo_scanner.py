@@ -4,12 +4,14 @@
 # Automatically detects black & white photos and produces a grayscale-enhanced
 # version alongside the color-enhanced version, using the Pillow image library.
 #
-# Enhancement is handled by the Topaz Gigapixel (High Fidelity V2) API by default,
-# which preserves original details without hallucinating new ones.
+# Enhancement pipeline: Pillow MedianFilter removes dust first, then xAI enhances
+# color, exposure, and sharpness to produce a modern-looking result.
 #
-# xAI fallback: To route a specific file through xAI instead of Topaz, prefix the
-# filename with 'xAI_' before dropping it in ~/Pictures, e.g.:
-#   xAI_IMG_20260702_0015_ai.jpg  →  processed by xAI  →  IMG_20260702_0015_ai.jpg
+# Enhancement pipeline: Pillow dust removal (MedianFilter size=5) runs first on every
+# file, then the result is sent to xAI for color correction and enhancement.
+# Topaz fallback: To route a specific file through Topaz instead of xAI, prefix the
+# filename with 'topaz_' before dropping it in ~/Pictures, e.g.:
+#   topaz_IMG_20260702_0015.jpg  →  processed by Topaz  →  IMG_20260702_0015_ai.jpg
 #
 # Usage:
 #   python photo_scanner.py [--folder-id <DRIVE_FOLDER_ID>]
@@ -54,7 +56,7 @@ import glob
 import base64
 import requests
 import time
-from PIL import Image
+from PIL import Image, ImageFilter
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -78,25 +80,22 @@ SCANNER_OUTPUT = '/Users/sreynoso/Pictures'
 TOPAZ_API_KEY = None
 XAI_API_KEY = None
 
-# xAI enhancement prompt (used for xAI fallback only)
-ENHANCEMENT_PROMPT = """Restore this old scanned photograph to look like it was taken with a modern camera.
+# xAI enhancement prompt
+ENHANCEMENT_PROMPT = """FACE PRESERVATION — HIGHEST PRIORITY:
+Every human face in this image is sacred. Do not alter, smooth, reconstruct, sharpen, or retouch any face in any way. Preserve every facial feature, skin texture, wrinkle, freckle, expression, and imperfection exactly as it appears in the input — at the pixel level. If a face is partially obscured, blurry, or in shadow, leave it exactly that way. Do not attempt to clarify, restore, or enhance any face.
 
-Critical rules:
-- Do not alter faces in any way. Preserve exact facial features, skin texture, expressions, and imperfections 100% unchanged. Apply zero sharpening or smoothing to any faces.
-- Do not invent, add, or reconstruct any details that are not clearly visible in the original. Only clean existing damage and apply global corrections.
-- Preserve the exact original composition and framing.
+COMPOSITION:
+Do not crop, rotate, or alter the framing in any way. Preserve the exact original composition.
 
-Enhancement instructions:
-- Correct and remove any overall color casts (including amber, yellow, blue, or magenta tints) across the entire photo so the colors appear natural and balanced.
-- Dramatically brighten the entire image and significantly boost overall color vibrance and saturation so the colors appear vivid, punchy, rich, and lively — exactly as if captured with a modern high-end digital camera under bright, balanced lighting. Maintain a natural, photorealistic look without oversaturation or artificial effects.
+ENHANCEMENT INSTRUCTIONS (apply to everything except faces):
+- Correct color casts (amber, yellow, blue, magenta) so colors appear natural and balanced.
+- Brighten the overall image and lift shadows so it looks like it was taken with a modern iPhone under good lighting.
+- Boost color vibrance and saturation to make colors vivid, punchy, and rich. Clothing and backgrounds should look especially bold and saturated while remaining photorealistic.
 - Remove yellowing and fading.
-- For all clothing and fabrics: keep the exact original color family and hue with 100% fidelity. Strongly enhance vibrance and saturation to make the colors much richer, deeper, and more brilliant while preserving the authentic hue. Apply the same strong vibrance/saturation boost to backgrounds, objects, and non-facial areas.
-- Remove scratches, dust, creases, and haze.
-- Improve clarity, sharpness, and overall image quality while keeping the result natural and photographic.
-- Balance lighting for even, natural exposure.
-- Apply a modern digital color grade that noticeably increases color intensity and depth across the photo while keeping skin tones on all faces completely natural, unaltered in hue, and true to the original.
+- Remove any remaining scratches, creases, or haze.
+- Sharpen and clarify non-face areas to improve overall image quality.
 
-If any physically printed dates or text appear on the original print, preserve them exactly. Otherwise, add no text or overlays.
+TEXT: If a physically printed date or text appears on the original, preserve it exactly. Add no new text or overlays.
 
 Output only the restored photograph."""
 
@@ -192,6 +191,16 @@ def is_black_and_white(image_path, saturation_threshold=15):
     return avg_saturation < saturation_threshold
 
 # ============================================================
+# DUST REMOVAL (PRE-PROCESSING)
+# ============================================================
+
+def apply_dust_removal(input_path, output_path):
+    """Apply a median filter to remove dust and scratch specks before AI enhancement."""
+    img = Image.open(input_path)
+    result = img.filter(ImageFilter.MedianFilter(size=5))  # size must be odd; 3=subtle, 5=moderate, 7=aggressive
+    result.save(output_path, 'JPEG', quality=95)
+
+# ============================================================
 # XAI ENHANCEMENT FUNCTION
 # ============================================================
 
@@ -278,9 +287,9 @@ def enhance_with_topaz(input_path, output_path):
                 'model': 'Wonder 2',
                 'output_format': 'jpeg',
                 'prompt': TOPAZ_PROMPT,
-                'face_enhancement': 'false',  # Preserve faces as-is
-                'denoise': '0.5',             # Remove scratches and dust
-                'creativity': '3',            # Moderate — restore without over-generating
+                'face_enhancement': 'false',  # Preserve faces as-is; true/false
+                'denoise': '1.0',             # Dust/scratch removal strength; range 0.0–1.0 (0=off, 1=maximum)
+                'creativity': '6',            # Reconstruction latitude; range 1–6 (1=conservative, 6=most generative)
             },
             timeout=60
         )
@@ -423,14 +432,14 @@ def main():
     patterns = [
         os.path.join(SCANNER_OUTPUT, 'IMG_*.jpg'),
         os.path.join(SCANNER_OUTPUT, 'IMG_*.JPG'),
-        os.path.join(SCANNER_OUTPUT, 'xAI_IMG_*.jpg'),
-        os.path.join(SCANNER_OUTPUT, 'xAI_IMG_*.JPG'),
+        os.path.join(SCANNER_OUTPUT, 'topaz_IMG_*.jpg'),
+        os.path.join(SCANNER_OUTPUT, 'topaz_IMG_*.JPG'),
     ]
     local_files = sorted(set(f for p in patterns for f in glob.glob(p)))
 
-    # Filter out any _ai files that might be lingering (but keep xAI_ prefixed files)
+    # Filter out any _ai or _dr (dust-removal temp) files that might be lingering
     local_files = [f for f in local_files if '_ai.' not in os.path.basename(f).lower()
-                   or os.path.basename(f).lower().startswith('xai_')]
+                   and '_dr.' not in os.path.basename(f).lower()]
 
     # Remove duplicates
     local_files = sorted(set(local_files))
@@ -481,11 +490,11 @@ def main():
         original_filename = os.path.basename(original_path)
         print(f"Processing [{i + 1}/{len(local_files)}]: {original_filename}")
 
-        # Check if this file is flagged for xAI fallback
-        use_xai = original_filename.lower().startswith('xai_')
+        # Check if this file is flagged for Topaz fallback
+        use_topaz = original_filename.lower().startswith('topaz_')
 
-        # Strip xAI_ prefix to get the base filename for processing
-        base_filename = original_filename[4:] if use_xai else original_filename
+        # Strip topaz_ prefix to get the base filename for processing
+        base_filename = original_filename[6:] if use_topaz else original_filename
 
         # Extract the date from the base filename
         file_date_match = re.match(r'IMG_(\d{8})_', base_filename)
@@ -494,15 +503,15 @@ def main():
             continue
         file_date = file_date_match.group(1)
 
-        if use_xai:
-            # xAI fallback: strip the xAI_ prefix, output with standard naming
-            # Input:  xAI_IMG_20260702_0015_ai.jpg
+        if use_topaz:
+            # Topaz fallback: strip the topaz_ prefix, output with standard naming
+            # Input:  topaz_IMG_20260702_0015.jpg
             # Output: IMG_20260702_0015_ai.jpg
             new_filename = base_filename
             new_path = os.path.join(SCANNER_OUTPUT, new_filename)
             if original_path != new_path:
                 os.rename(original_path, new_path)
-                print(f"  Renamed: {original_filename} -> {new_filename} (xAI fallback)")
+                print(f"  Renamed: {original_filename} -> {new_filename} (Topaz fallback)")
         else:
             # Normal flow: rename if needed to avoid sequence conflicts
             if needs_rename:
@@ -523,13 +532,22 @@ def main():
         if is_bw:
             print(f"  Detected as black & white image")
 
-        # Route to xAI or Topaz based on filename prefix
+        # Step 1: Dust removal pre-processing (always runs, output is a temp file)
+        dust_removed_path = new_path.replace('.jpg', '_dr.jpg').replace('.JPG', '_dr.jpg')
+        print(f"  Applying dust removal (MedianFilter size=5)...")
+        apply_dust_removal(new_path, dust_removed_path)
+
+        # Step 2: Route to xAI (default) or Topaz (topaz_ prefix) for enhancement
         ai_path = os.path.join(SCANNER_OUTPUT, ai_filename)
-        if use_xai:
-            print(f"  Using xAI (fallback requested via filename prefix)")
-            success = enhance_with_xai(new_path, ai_path)
+        if use_topaz:
+            print(f"  Using Topaz (fallback requested via filename prefix)")
+            success = enhance_with_topaz(dust_removed_path, ai_path)
         else:
-            success = enhance_with_topaz(new_path, ai_path)
+            success = enhance_with_xai(dust_removed_path, ai_path)
+
+        # Clean up temp dust-removal file
+        if os.path.exists(dust_removed_path):
+            os.remove(dust_removed_path)
 
         if success:
             # Upload both the original and enhanced version to Drive

@@ -7,10 +7,11 @@ A Python script that automates the end-to-end workflow for digitizing old family
 1. **Picks up scanned JPEGs** from the local scanner output folder (`~/Pictures`)
 2. **Detects conflicts** with files already on Google Drive and renames files to avoid duplicates
 3. **Detects black & white photos** automatically by measuring color saturation
-4. **Enhances each photo** using the Topaz Gigapixel (High Fidelity V2) API by default — restoring clarity and detail while preserving original content without hallucinating new details
-5. **xAI fallback** — individual files can be routed to xAI instead of Topaz by prefixing the filename with `xAI_` (see Usage section)
-6. **Uploads to Google Drive** — both the original scan and the AI-enhanced version (and a grayscale-enhanced version for B&W photos)
-7. **Cleans up** local files after successful upload
+4. **Removes dust and scratches** using a Pillow MedianFilter (size=5) pre-processing step before AI enhancement
+5. **Enhances each photo** using xAI — correcting color casts, lifting shadows, boosting vibrance, and producing a modern, iPhone-like result while strictly preserving all facial features
+6. **Topaz fallback** — individual files can be routed to Topaz instead of xAI by prefixing the filename with `topaz_` (see Usage section)
+7. **Uploads to Google Drive** — both the original scan and the AI-enhanced version (and a grayscale-enhanced version for B&W photos)
+8. **Cleans up** local files after successful upload
 
 ## Output Files Per Photo
 
@@ -92,20 +93,22 @@ python photo_scanner.py
 
 If `--folder-id` is passed on the command line it takes precedence over the config file. API keys in the config file take precedence over environment variables.
 
-### xAI Fallback
+### Topaz Fallback
 
-If you're not satisfied with the Topaz output for a specific photo, you can route it through xAI instead by prefixing the filename with `xAI_` before dropping it in `~/Pictures`:
+If you want to route a specific photo through Topaz instead of xAI, prefix the filename with `topaz_` before dropping it in `~/Pictures`:
 
 | Input filename | Processed by | Output filename |
 |---|---|---|
-| `IMG_20260702_0015.jpg` | Topaz (default) | `IMG_20260702_0015_ai.jpg` |
-| `xAI_IMG_20260702_0015_ai.jpg` | xAI (fallback) | `IMG_20260702_0015_ai.jpg` |
+| `IMG_20260702_0015.jpg` | xAI (default) | `IMG_20260702_0015_ai.jpg` |
+| `topaz_IMG_20260702_0015.jpg` | Topaz (fallback) | `IMG_20260702_0015_ai.jpg` |
 
-The `xAI_` prefix is stripped from the output filename automatically.
+The `topaz_` prefix is stripped from the output filename automatically. Pillow dust removal runs first regardless of which enhancer is used.
 
 ## Notes
 
-- Topaz Gigapixel High Fidelity V2 was chosen specifically for its "maximum source preservation" — it enhances what's already in the photo without inventing details or altering faces.
+- xAI is the default enhancer — it produces vivid, modern-looking results similar to an iPhone photo. The prompt is specifically tuned to preserve faces at the pixel level while aggressively enhancing everything else.
+- Pillow dust removal runs before every API call, giving the AI a cleaner input image.
+- Topaz is available as a fallback via the `topaz_` filename prefix if needed.
 - Only files that complete the full pipeline (original + AI enhancement + upload) are deleted locally.
 - The script is safe to re-run — it checks Drive for existing sequence numbers and avoids overwriting files.
 - Credential and token files are excluded from this repository via `.gitignore`.
