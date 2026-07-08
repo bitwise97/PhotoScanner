@@ -4,6 +4,13 @@
 # Automatically detects black & white photos and produces a grayscale-enhanced
 # version alongside the color-enhanced version, using the Pillow image library.
 #
+# Enhancement is handled by the Topaz Gigapixel (High Fidelity V2) API by default,
+# which preserves original details without hallucinating new ones.
+#
+# xAI fallback: To route a specific file through xAI instead of Topaz, prefix the
+# filename with 'xAI_' before dropping it in ~/Pictures, e.g.:
+#   xAI_IMG_20260702_0015_ai.jpg  →  processed by xAI  →  IMG_20260702_0015_ai.jpg
+#
 # Usage:
 #   python photo_scanner.py [--folder-id <DRIVE_FOLDER_ID>]
 #
@@ -15,6 +22,7 @@
 #   If --folder-id is not provided, the script checks for ~/.photo-scanner-config.json
 #   (in your home directory, e.g. /Users/sreynoso/.photo-scanner-config.json):
 #   { "folder_id": "<DRIVE_FOLDER_ID>" }
+#   *Note: To show hidden files, press Command (⌘) + Shift (⇧) + . (period)
 #
 # Examples:
 #   python photo_scanner.py --folder-id 1R5UhpYBe2nzZaf5T8qtAhHha76ajhRhO
@@ -25,7 +33,8 @@
 #     automatically when new scanned files are detected.
 #   - Pillow (pip install Pillow) must be installed for black & white photo detection
 #     and grayscale image processing.
-#   - XAI_API_KEY must be set as an environment variable.
+#   - TOPAZ_API_KEY must be set as an environment variable.
+#   - XAI_API_KEY must be set as an environment variable (only needed for xAI fallback).
 #   - On first run, a browser window will open to authorize Google Drive access.
 #     If the token expires (e.g. after 7 days in test mode), the script will
 #     re-authorize automatically via browser rather than failing.
@@ -57,7 +66,11 @@ TOKEN_FILE = os.path.expanduser('~/photo-scanner/token.json')
 # Local scanner output folder
 SCANNER_OUTPUT = '/Users/sreynoso/Pictures'
 
-# xAI API key - note that the following API key has been added as an environment variable (type 'env' to confirm)
+# Topaz API key — set as an environment variable: export TOPAZ_API_KEY=your_key_here
+# Obtain your API key from https://developer.topazlabs.com
+TOPAZ_API_KEY = os.environ.get('TOPAZ_API_KEY', 'YOUR_TOPAZ_API_KEY_HERE')
+
+# xAI API key — only used when a file is prefixed with 'xAI_' to trigger xAI fallback
 XAI_API_KEY = os.environ.get('XAI_API_KEY')
 
 # xAI enhancement prompt
@@ -226,6 +239,87 @@ def enhance_with_xai(input_path, output_path):
 
 
 # ============================================================
+# TOPAZ ENHANCEMENT FUNCTION
+# ============================================================
+
+def enhance_with_topaz(input_path, output_path):
+    """Send a photo to Topaz Gigapixel (High Fidelity V2) for enhancement and save the result."""
+    print(f"  Sending to Topaz for enhancement...")
+
+    topaz_enhance_url = 'https://api.topazlabs.com/image/v1/enhance/async'
+    topaz_status_url = 'https://api.topazlabs.com/image/v1/status'
+    topaz_download_url = 'https://api.topazlabs.com/image/v1/download'
+
+    headers = {'X-API-KEY': TOPAZ_API_KEY}
+
+    with open(input_path, 'rb') as f:
+        response = requests.post(
+            topaz_enhance_url,
+            headers=headers,
+            files={'image': (os.path.basename(input_path), f, 'image/jpeg')},
+            data={
+                'model': 'High Fidelity V2',
+                'output_format': 'jpeg',
+                'face_enhancement': 'false',  # Preserve faces as-is
+                'strength': '0.5',            # Moderate enhancement, conservative
+            },
+            timeout=60
+        )
+
+    if response.status_code != 200:
+        print(f"  ERROR: Topaz returned status {response.status_code}")
+        print(f"  Response: {response.text}")
+        return False
+
+    process_id = response.json().get('process_id')
+    if not process_id:
+        print(f"  ERROR: No process_id in Topaz response: {response.json()}")
+        return False
+
+    print(f"  Topaz job submitted (process_id: {process_id}). Waiting for completion...")
+
+    # Poll for completion
+    for attempt in range(60):
+        time.sleep(5)
+        status_response = requests.get(
+            f'{topaz_status_url}/{process_id}',
+            headers=headers,
+            timeout=30
+        )
+        if status_response.status_code != 200:
+            print(f"  ERROR: Failed to check Topaz status: {status_response.status_code}")
+            return False
+
+        status = status_response.json().get('status')
+        if status == 'completed':
+            break
+        elif status == 'failed':
+            print(f"  ERROR: Topaz enhancement job failed.")
+            print(f"  Response: {status_response.json()}")
+            return False
+        # Still processing — keep polling
+
+    else:
+        print(f"  ERROR: Topaz enhancement timed out after 5 minutes.")
+        return False
+
+    # Download the enhanced image
+    download_response = requests.get(
+        f'{topaz_download_url}/{process_id}',
+        headers=headers,
+        timeout=120
+    )
+    if download_response.status_code != 200:
+        print(f"  ERROR: Failed to download Topaz result: {download_response.status_code}")
+        return False
+
+    with open(output_path, 'wb') as f:
+        f.write(download_response.content)
+
+    print(f"  Enhanced image saved: {os.path.basename(output_path)}")
+    return True
+
+# ============================================================
 # CONFIG HANDLING
 # ============================================================
 
@@ -266,15 +360,20 @@ def main():
         print('  { "folder_id": "<DRIVE_FOLDER_ID>" }')
         return
 
-    # Step 1: Find scanner output files
-    pattern = os.path.join(SCANNER_OUTPUT, 'IMG_*.jpg') 
-    # Also check for uppercase .JPG
-    local_files = sorted(glob.glob(pattern) + glob.glob(pattern.replace('.jpg', '.JPG')))
+    # Step 1: Find scanner output files — both normal (IMG_*) and xAI fallback (xAI_IMG_*)
+    patterns = [
+        os.path.join(SCANNER_OUTPUT, 'IMG_*.jpg'),
+        os.path.join(SCANNER_OUTPUT, 'IMG_*.JPG'),
+        os.path.join(SCANNER_OUTPUT, 'xAI_IMG_*.jpg'),
+        os.path.join(SCANNER_OUTPUT, 'xAI_IMG_*.JPG'),
+    ]
+    local_files = sorted(set(f for p in patterns for f in glob.glob(p)))
 
-    # Filter out any _ai files that might be lingering
-    local_files = [f for f in local_files if '_ai.' not in f.lower()]
+    # Filter out any _ai files that might be lingering (but keep xAI_ prefixed files)
+    local_files = [f for f in local_files if '_ai.' not in os.path.basename(f).lower()
+                   or os.path.basename(f).lower().startswith('xai_')]
 
-    # Remove duplicates (in case .jpg and .JPG matched the same file)
+    # Remove duplicates
     local_files = sorted(set(local_files))
 
     if not local_files:
@@ -288,9 +387,10 @@ def main():
     print("Authenticating with Google Drive...")
     service = authenticate_drive()
 
-    # Step 3: Extract date prefix from the first scanner file
+    # Step 3: Extract date prefix from the first scanner file (strip xAI_ prefix if present)
     first_filename = os.path.basename(local_files[0])
-    date_match = re.match(r'IMG_(\d{8})_', first_filename)
+    first_filename_normalized = first_filename[4:] if first_filename.lower().startswith('xai_') else first_filename
+    date_match = re.match(r'IMG_(\d{8})_', first_filename_normalized)
     if not date_match:
         print(f"ERROR: First file doesn't match expected pattern: {first_filename}")
         return
@@ -322,25 +422,40 @@ def main():
         original_filename = os.path.basename(original_path)
         print(f"Processing [{i + 1}/{len(local_files)}]: {original_filename}")
 
-        # Extract the date from the original scanner filename
-        file_date_match = re.match(r'IMG_(\d{8})_', original_filename)
+        # Check if this file is flagged for xAI fallback
+        use_xai = original_filename.lower().startswith('xai_')
+
+        # Strip xAI_ prefix to get the base filename for processing
+        base_filename = original_filename[4:] if use_xai else original_filename
+
+        # Extract the date from the base filename
+        file_date_match = re.match(r'IMG_(\d{8})_', base_filename)
         if not file_date_match:
             print(f"  WARNING: Filename doesn't match expected pattern, skipping: {original_filename}")
             continue
         file_date = file_date_match.group(1)
 
-        if needs_rename:
-            # Calculate new sequence number
-            new_seq = last_seq + i + 1
-            new_filename = f"IMG_{file_date}_{new_seq:04d}.jpg"
+        if use_xai:
+            # xAI fallback: strip the xAI_ prefix, output with standard naming
+            # Input:  xAI_IMG_20260702_0015_ai.jpg
+            # Output: IMG_20260702_0015_ai.jpg
+            new_filename = base_filename
+            new_path = os.path.join(SCANNER_OUTPUT, new_filename)
+            if original_path != new_path:
+                os.rename(original_path, new_path)
+                print(f"  Renamed: {original_filename} -> {new_filename} (xAI fallback)")
         else:
-            new_filename = original_filename
+            # Normal flow: rename if needed to avoid sequence conflicts
+            if needs_rename:
+                new_seq = last_seq + i + 1
+                new_filename = f"IMG_{file_date}_{new_seq:04d}.jpg"
+            else:
+                new_filename = original_filename
 
-        # Rename the local file if needed
-        new_path = os.path.join(SCANNER_OUTPUT, new_filename)
-        if original_path != new_path:
-            os.rename(original_path, new_path)
-            print(f"  Renamed: {original_filename} -> {new_filename}")
+            new_path = os.path.join(SCANNER_OUTPUT, new_filename)
+            if original_path != new_path:
+                os.rename(original_path, new_path)
+                print(f"  Renamed: {original_filename} -> {new_filename}")
 
         ai_filename = new_filename.replace('.jpg', '_ai.jpg').replace('.JPG', '_ai.jpg')
 
@@ -349,9 +464,13 @@ def main():
         if is_bw:
             print(f"  Detected as black & white image")
 
-        # Enhance with xAI
+        # Route to xAI or Topaz based on filename prefix
         ai_path = os.path.join(SCANNER_OUTPUT, ai_filename)
-        success = enhance_with_xai(new_path, ai_path)
+        if use_xai:
+            print(f"  Using xAI (fallback requested via filename prefix)")
+            success = enhance_with_xai(new_path, ai_path)
+        else:
+            success = enhance_with_topaz(new_path, ai_path)
 
         if success:
             # Upload both the original and enhanced version to Drive
