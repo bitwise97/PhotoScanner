@@ -78,7 +78,7 @@ SCANNER_OUTPUT = '/Users/sreynoso/Pictures'
 TOPAZ_API_KEY = None
 XAI_API_KEY = None
 
-# xAI enhancement prompt
+# xAI enhancement prompt (used for xAI fallback only)
 ENHANCEMENT_PROMPT = """Restore this old scanned photograph to look like it was taken with a modern camera.
 
 Critical rules:
@@ -99,6 +99,17 @@ Enhancement instructions:
 If any physically printed dates or text appear on the original print, preserve them exactly. Otherwise, add no text or overlays.
 
 Output only the restored photograph."""
+
+# Topaz enhancement prompt (max 1024 characters — condensed version of the xAI prompt)
+TOPAZ_PROMPT = ("Restore this old scanned photograph. "
+                "Remove scratches, dust, creases, and haze. "
+                "Correct color casts and remove yellowing and fading. "
+                "Boost color vibrance and saturation for a vivid, modern look. "
+                "Balance lighting for even, natural exposure. "
+                "Do not alter faces in any way — preserve all facial features exactly. "
+                "Do not invent details not visible in the original. "
+                "Preserve original composition and framing. "
+                "Preserve any physically printed dates or text exactly as they appear.")
 
 # ============================================================
 # GOOGLE DRIVE FUNCTIONS
@@ -251,7 +262,7 @@ def enhance_with_topaz(input_path, output_path):
     """Send a photo to Topaz Gigapixel (High Fidelity V2) for enhancement and save the result."""
     print(f"  Sending to Topaz for enhancement...")
 
-    topaz_enhance_url = 'https://api.topazlabs.com/image/v1/enhance/async'
+    topaz_enhance_url = 'https://api.topazlabs.com/image/v1/enhance-gen/async'
     topaz_status_url = 'https://api.topazlabs.com/image/v1/status'
     topaz_download_url = 'https://api.topazlabs.com/image/v1/download'
 
@@ -264,10 +275,12 @@ def enhance_with_topaz(input_path, output_path):
             headers=headers,
             files={'image': (os.path.basename(input_path), f, 'image/jpeg')},
             data={
-                'model': 'High Fidelity V2',
+                'model': 'Wonder 2',
                 'output_format': 'jpeg',
+                'prompt': TOPAZ_PROMPT,
                 'face_enhancement': 'false',  # Preserve faces as-is
-                'strength': '0.5',            # Moderate enhancement, conservative
+                'denoise': '0.5',             # Remove scratches and dust
+                'creativity': '3',            # Moderate — restore without over-generating
             },
             timeout=60
         )
