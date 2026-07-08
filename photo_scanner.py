@@ -325,9 +325,9 @@ def enhance_with_topaz(input_path, output_path):
         print(f"  ERROR: Failed to get Topaz download URL: {download_response.status_code}")
         return False
 
-    image_url = download_response.json().get('url')
+    image_url = download_response.json().get('download_url')
     if not image_url:
-        print(f"  ERROR: No URL in Topaz download response: {download_response.json()}")
+        print(f"  ERROR: No download_url in Topaz download response: {download_response.json()}")
         return False
 
     # Download the actual image from the URL
