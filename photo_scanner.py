@@ -283,8 +283,8 @@ def enhance_with_topaz(input_path, output_path):
 
     print(f"  Topaz job submitted (process_id: {process_id}). Waiting for completion...")
 
-    # Poll for completion
-    for attempt in range(60):
+    # Poll for completion (up to 10 minutes)
+    for attempt in range(120):
         time.sleep(5)
         status_response = requests.get(
             f'{topaz_status_url}/{process_id}',
@@ -296,16 +296,19 @@ def enhance_with_topaz(input_path, output_path):
             return False
 
         status = status_response.json().get('status')
-        if status == 'completed':
+        if status == 'Completed':
             break
-        elif status == 'failed':
+        elif status == 'Failed':
             print(f"  ERROR: Topaz enhancement job failed.")
             print(f"  Response: {status_response.json()}")
+            return False
+        elif status == 'Cancelled':
+            print(f"  ERROR: Topaz enhancement job was cancelled.")
             return False
         # Still processing — keep polling
 
     else:
-        print(f"  ERROR: Topaz enhancement timed out after 5 minutes.")
+        print(f"  ERROR: Topaz enhancement timed out after 10 minutes.")
         return False
 
     # Download the enhanced image
