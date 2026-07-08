@@ -25,8 +25,8 @@ A Python script that automates the end-to-end workflow for digitizing old family
 - Python 3.7+
 - A Google Cloud project with the **Google Drive API** enabled
 - OAuth 2.0 credentials file downloaded from the Google Cloud Console
-- A **Topaz API key** set as the environment variable `TOPAZ_API_KEY` (obtain from [developer.topazlabs.com](https://developer.topazlabs.com))
-- An **xAI API key** set as the environment variable `XAI_API_KEY` (only required for xAI fallback)
+- A **Topaz API key** (obtain from [developer.topazlabs.com](https://developer.topazlabs.com))
+- An **xAI API key** (only required for xAI fallback)
 - **Pillow** for black & white photo detection and grayscale image processing
 - **launchctl** configured to monitor `~/Pictures` and trigger the script automatically when new scanned files are detected
 
@@ -40,17 +40,17 @@ pip install Pillow google-auth google-auth-oauthlib google-auth-httplib2 google-
 
 1. Go to the [Google Cloud Console](https://console.cloud.google.com/) and enable the **Google Drive API**.
 2. Create OAuth 2.0 credentials (Desktop app) and save the file as `photo_scanner_automation_credentials.json` in the project folder.
-3. Set your Topaz API key as an environment variable:
-   ```bash
-   export TOPAZ_API_KEY=your_topaz_api_key_here
+3. Create `~/.photo-scanner-config.json` in your home directory with your settings:
+   ```json
+   {
+     "folder_id": "your_google_drive_folder_id",
+     "topaz_api_key": "your_topaz_api_key",
+     "xai_api_key": "your_xai_api_key"
+   }
    ```
-4. Optionally, set your xAI API key if you plan to use the xAI fallback:
-   ```bash
-   export XAI_API_KEY=your_xai_api_key_here
-   ```
-5. Create `~/.photo-scanner-config.json` with your Google Drive folder ID (see Usage section for details).
-6. Configure launchctl to monitor `~/Pictures` and automatically trigger the script when new scanned files appear.
-   The launchctl plist should run: `python /path/to/photo_scanner.py` (no parameters needed — it reads from the config file).
+   The `xai_api_key` is optional — only needed if you use the xAI fallback feature.
+4. Configure launchctl to monitor `~/Pictures` and automatically trigger the script when new scanned files appear.
+   The launchctl plist should run: `python /path/to/photo_scanner.py` (no parameters needed — all settings are read from the config file).
 
 On first run, a browser window will open to authorize Google Drive access. The token is saved locally and refreshed automatically. If the token expires (e.g. after 7 days in test mode), the script will open the browser to re-authorize rather than failing.
 
@@ -71,14 +71,18 @@ The script can be configured in two ways:
 python photo_scanner.py --folder-id 1R5UhpYBe2nzZaf5T8qtAhHha76ajhRhO
 ```
 
-#### Option 2: Config file (for automated/launchctl use)
+#### Option 2: Config file (recommended — required for launchctl)
 
-Create `~/.photo-scanner-config.json` in your home directory (e.g., `/Users/sreynoso/.photo-scanner-config.json`):
+The config file at `~/.photo-scanner-config.json` (in your home directory) stores all settings in one place, including API keys. This is the recommended approach and the only one that works with launchctl, since launchctl does not load your shell profile or environment variables.
+
 ```json
 {
-  "folder_id": "1R5UhpYBe2nzZaf5T8qtAhHha76ajhRhO"
+  "folder_id": "1R5UhpYBe2nzZaf5T8qtAhHha76ajhRhO",
+  "topaz_api_key": "your_topaz_api_key",
+  "xai_api_key": "your_xai_api_key"
 }
 ```
+
 (The `~` symbol represents your home directory. To show hidden files in Finder, press `Cmd + Shift + .`)
 
 Then run the script with no parameters:
@@ -86,7 +90,7 @@ Then run the script with no parameters:
 python photo_scanner.py
 ```
 
-If both are provided, the command-line parameter takes precedence.
+If `--folder-id` is passed on the command line it takes precedence over the config file. API keys in the config file take precedence over environment variables.
 
 ### xAI Fallback
 

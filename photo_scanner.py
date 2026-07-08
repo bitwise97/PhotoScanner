@@ -19,22 +19,29 @@
 #                  (Found in the folder's URL: drive.google.com/drive/folders/<ID>)
 #
 # Configuration:
-#   If --folder-id is not provided, the script checks for ~/.photo-scanner-config.json
-#   (in your home directory, e.g. /Users/sreynoso/.photo-scanner-config.json):
-#   { "folder_id": "<DRIVE_FOLDER_ID>" }
-#   *Note: To show hidden files, press Command (⌘) + Shift (⇧) + . (period)
+#   The script reads settings from ~/.photo-scanner-config.json
+#   (in your home directory, e.g. /Users/sreynoso/.photo-scanner-config.json).
+#   *Note: To show hidden files in Finder, press Command (⌘) + Shift (⇧) + . (period)
+#
+#   Config file format:
+#   {
+#     "folder_id":    "<DRIVE_FOLDER_ID>",
+#     "topaz_api_key": "<TOPAZ_API_KEY>",
+#     "xai_api_key":  "<XAI_API_KEY>"
+#   }
+#
+#   API keys can also be set as environment variables (TOPAZ_API_KEY, XAI_API_KEY).
+#   The config file takes precedence over environment variables.
 #
 # Examples:
 #   python photo_scanner.py --folder-id 1R5UhpYBe2nzZaf5T8qtAhHha76ajhRhO
-#   python photo_scanner.py  # reads folder_id from ~/.photo-scanner-config.json
+#   python photo_scanner.py  # reads all settings from ~/.photo-scanner-config.json
 #
 # Prerequisites:
 #   - launchctl must be configured to monitor ~/Pictures and trigger this script
 #     automatically when new scanned files are detected.
 #   - Pillow (pip install Pillow) must be installed for black & white photo detection
 #     and grayscale image processing.
-#   - TOPAZ_API_KEY must be set as an environment variable.
-#   - XAI_API_KEY must be set as an environment variable (only needed for xAI fallback).
 #   - On first run, a browser window will open to authorize Google Drive access.
 #     If the token expires (e.g. after 7 days in test mode), the script will
 #     re-authorize automatically via browser rather than failing.
@@ -66,12 +73,10 @@ TOKEN_FILE = os.path.expanduser('~/photo-scanner/token.json')
 # Local scanner output folder
 SCANNER_OUTPUT = '/Users/sreynoso/Pictures'
 
-# Topaz API key — set as an environment variable: export TOPAZ_API_KEY=your_key_here
-# Obtain your API key from https://developer.topazlabs.com
-TOPAZ_API_KEY = os.environ.get('TOPAZ_API_KEY')
-
-# xAI API key — only used when a file is prefixed with 'xAI_' to trigger xAI fallback
-XAI_API_KEY = os.environ.get('XAI_API_KEY')
+# API keys — loaded from ~/.photo-scanner-config.json or environment variables.
+# Config file takes precedence. See header comment for config file format.
+TOPAZ_API_KEY = None
+XAI_API_KEY = None
 
 # xAI enhancement prompt
 ENHANCEMENT_PROMPT = """Restore this old scanned photograph to look like it was taken with a modern camera.
@@ -324,17 +329,35 @@ def enhance_with_topaz(input_path, output_path):
 # ============================================================
 
 def load_config_file():
-    """Load folder ID from config file if it exists."""
+    """Load settings from ~/.photo-scanner-config.json.
+
+    Returns the parsed config dict, or an empty dict if the file doesn't exist.
+    API keys in the config file take precedence over environment variables.
+    """
+    global TOPAZ_API_KEY, XAI_API_KEY
+
     config_path = os.path.expanduser('~/.photo-scanner-config.json')
+
+    # Start with environment variables as the baseline
+    TOPAZ_API_KEY = os.environ.get('TOPAZ_API_KEY')
+    XAI_API_KEY = os.environ.get('XAI_API_KEY')
+
     if not os.path.exists(config_path):
-        return None
+        return {}
     try:
         with open(config_path, 'r') as f:
             config = json.load(f)
-            return config.get('folder_id')
+
+        # Config file values override environment variables
+        if config.get('topaz_api_key'):
+            TOPAZ_API_KEY = config['topaz_api_key']
+        if config.get('xai_api_key'):
+            XAI_API_KEY = config['xai_api_key']
+
+        return config
     except Exception as e:
         print(f"WARNING: Could not read config file {config_path}: {e}")
-        return None
+        return {}
 
 # ============================================================
 # MAIN PIPELINE
@@ -345,19 +368,24 @@ def main():
     parser.add_argument('--folder-id', required=False, help='Google Drive folder ID for the current album')
     args = parser.parse_args()
 
-    # Use CLI parameter if provided, otherwise try config file
-    folder_id = args.folder_id
-    if not folder_id:
-        folder_id = load_config_file()
+    # Load config file (also sets TOPAZ_API_KEY and XAI_API_KEY globals)
+    config = load_config_file()
+
+    # Use CLI parameter if provided, otherwise fall back to config file
+    folder_id = args.folder_id or config.get('folder_id')
 
     if not folder_id:
         config_path = os.path.expanduser('~/.photo-scanner-config.json')
         print("ERROR: folder_id not provided via --folder-id parameter or config file")
         print(f"\nUsage:")
         print("  python photo_scanner.py --folder-id <DRIVE_FOLDER_ID>")
-        print(f"\nOr create a config file at: {config_path}")
-        print('  with contents:')
-        print('  { "folder_id": "<DRIVE_FOLDER_ID>" }')
+        print(f"\nOr add it to the config file at: {config_path}")
+        print('  { "folder_id": "<DRIVE_FOLDER_ID>", "topaz_api_key": "...", "xai_api_key": "..." }')
+        return
+
+    if not TOPAZ_API_KEY:
+        print("ERROR: TOPAZ_API_KEY not found in config file or environment variables.")
+        print("Add 'topaz_api_key' to ~/.photo-scanner-config.json or set the TOPAZ_API_KEY environment variable.")
         return
 
     # Step 1: Find scanner output files — both normal (IMG_*) and xAI fallback (xAI_IMG_*)
