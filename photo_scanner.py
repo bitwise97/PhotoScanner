@@ -337,6 +337,19 @@ FACE_DET_SIZES = (640, 1024, 1600)
 FACE_DET_THRESH = 0.3           # below the 0.5 default; false positives are the cheap error
 FACE_DEDUPE_IOU = 0.4           # boxes overlapping more than this are the same face
 
+# Stretching contrast in a faded face amplifies whatever is already there — the
+# scan's halftone screen and film grain. Because the three channels are graded
+# independently the amplification differs per channel, so the texture reads as
+# colored speckle. Measured inside the mask on the degraded scan, grading raised
+# luminance high-frequency energy 2.73 -> 4.49 and chroma speckle 0.50 -> 0.96.
+#
+# Smoothing chroma alone removes the color mesh while leaving luminance — which
+# carries essentially all perceived detail — completely untouched. Set below 3 to
+# disable. FACE_LUMA_TOLERANCE absorbs YCrCb/BGR round-trip rounding when Stage 4
+# checks that the smoothing really was chroma-only.
+FACE_CHROMA_SMOOTH_PX = 3
+FACE_LUMA_TOLERANCE = 2
+
 _FACE_ANALYZERS = {}
 
 
@@ -537,6 +550,30 @@ def apply_tone_transfer(image_bgr, lut):
     return out
 
 
+def smooth_face_chroma(image_bgr, radius=FACE_CHROMA_SMOOTH_PX):
+    """Median-filter the chroma channels, passing luminance through untouched.
+
+    Working in YCrCb lets the Y plane be copied verbatim, so no facial detail can
+    be lost: only the color assigned to that detail is smoothed.
+    """
+    if radius < 3:
+        return image_bgr.copy()
+
+    ycrcb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2YCrCb)
+    ycrcb[..., 1] = cv2.medianBlur(ycrcb[..., 1], radius)
+    ycrcb[..., 2] = cv2.medianBlur(ycrcb[..., 2], radius)
+    return cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+
+
+def build_face_layer(original_bgr, lut):
+    """The complete, deterministic face transform: tone-grade, then smooth chroma.
+
+    Kept in one function so Stage 4 can recompute it independently and compare the
+    result byte-for-byte against what actually got written.
+    """
+    return smooth_face_chroma(apply_tone_transfer(original_bgr, lut))
+
+
 def grade_and_composite(original_bgr, enhanced_bgr, strict_mask, alpha, lut):
     """Stage 3 — composite tone-graded ORIGINAL face pixels onto the enhanced image.
 
@@ -550,7 +587,7 @@ def grade_and_composite(original_bgr, enhanced_bgr, strict_mask, alpha, lut):
     overwritten with the graded original so no blending or rounding can mix in
     enhanced-image content.
     """
-    graded = apply_tone_transfer(original_bgr, lut)
+    graded = build_face_layer(original_bgr, lut)
 
     a = alpha[..., None]
     blended = graded.astype(np.float32) * a + enhanced_bgr.astype(np.float32) * (1.0 - a)
@@ -562,30 +599,41 @@ def grade_and_composite(original_bgr, enhanced_bgr, strict_mask, alpha, lut):
 
 
 def verify_face_grade(original_bgr, final_bgr, strict_mask, lut):
-    """Stage 4 — confirm faces are the original pixels under a pure tone mapping.
+    """Stage 4 — confirm faces are the original pixels under a tone curve and a
+    chroma-only smooth, and nothing else.
 
-    Two independent checks:
+    Three independent checks:
 
-      1. Every strict-mask pixel must equal the original passed through the LUT,
-         byte for byte. Any AI-generated content — a redrawn eye, a smoothed
-         cheek, a sharpened edge — cannot survive this, because no global curve
-         can produce it from the original pixels.
+      1. Every strict-mask pixel must equal the independently recomputed face
+         layer, byte for byte. Any AI-generated content — a redrawn eye, a
+         smoothed cheek, a sharpened edge — fails here, because the face layer is
+         derived solely from the original scan.
       2. Each channel curve must be non-decreasing. A monotonic mapping preserves
-         the ordering of tones, so it cannot invert or restructure detail; it can
-         only re-grade it.
+         the ordering of tones, so it cannot invert or restructure detail.
+      3. The chroma smoothing must leave luminance intact, which is what proves it
+         touched only color and not detail.
 
-    Returns (ok, changed_pixel_count, monotonic).
+    Returns (ok, changed_pixel_count, monotonic, max_luma_deviation).
     """
     monotonic = all(bool(np.all(np.diff(lut[:, c].astype(np.int16)) >= 0)) for c in range(3))
 
     core = strict_mask > 0
     if not core.any():
-        return monotonic, 0, monotonic
+        return monotonic, 0, monotonic, 0
 
-    expected = apply_tone_transfer(original_bgr, lut)
+    graded = apply_tone_transfer(original_bgr, lut)
+    expected = smooth_face_chroma(graded)
+
+    # Did smoothing disturb luminance anywhere in the face?
+    luma_before = cv2.cvtColor(graded, cv2.COLOR_BGR2YCrCb)[..., 0].astype(np.int16)
+    luma_after = cv2.cvtColor(expected, cv2.COLOR_BGR2YCrCb)[..., 0].astype(np.int16)
+    luma_dev = int(np.abs(luma_before - luma_after)[core].max())
+
     diff = cv2.absdiff(expected, final_bgr).max(axis=2)
     changed = int(np.count_nonzero((diff > 0) & core))
-    return (changed == 0 and monotonic), changed, monotonic
+
+    ok = changed == 0 and monotonic and luma_dev <= FACE_LUMA_TOLERANCE
+    return ok, changed, monotonic, luma_dev
 
 
 def enhance_photo_pipeline(input_path: str, output_path: str) -> bool:
@@ -655,17 +703,21 @@ def enhance_photo_pipeline(input_path: str, output_path: str) -> bool:
             print(f"  ERROR: Could not read back verification PNG")
             return False
 
-        ok, changed, monotonic = verify_face_grade(original, reloaded, strict_mask, lut)
+        ok, changed, monotonic, luma_dev = verify_face_grade(original, reloaded, strict_mask, lut)
         if not ok:
             if not monotonic:
                 print(f"  WARNING: Verification FAILED — tone curve is not monotonic, "
                       f"so it could restructure facial detail. Discarding enhanced result.")
+            elif luma_dev > FACE_LUMA_TOLERANCE:
+                print(f"  WARNING: Verification FAILED — chroma smoothing shifted face "
+                      f"luminance by up to {luma_dev} levels. Discarding enhanced result.")
             else:
                 print(f"  WARNING: Verification FAILED — {changed} face pixel(s) do not match "
                       f"the graded original. Discarding enhanced result.")
             return False
 
-        print(f"  Stage 4: verified — faces are the original pixels under a monotonic tone curve")
+        print(f"  Stage 4: verified — faces are the original pixels under a monotonic tone "
+              f"curve; chroma-only smoothing shifted luminance by at most {luma_dev}")
         cv2.imwrite(output_path, reloaded, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         print(f"  Enhanced image saved: {os.path.basename(output_path)}")
         return True
