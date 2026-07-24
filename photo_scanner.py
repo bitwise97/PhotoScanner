@@ -81,23 +81,34 @@ TOPAZ_API_KEY = None
 XAI_API_KEY = None
 
 # xAI enhancement prompt
-ENHANCEMENT_PROMPT = """FACE PRESERVATION — HIGHEST PRIORITY:
-Every human face in this image is sacred. Do not alter, smooth, reconstruct, sharpen, or retouch any face in any way. Preserve every facial feature, skin texture, wrinkle, freckle, expression, and imperfection exactly as it appears in the input — at the pixel level. If a face is partially obscured, blurry, or in shadow, leave it exactly that way. Do not attempt to clarify, restore, or enhance any face.
+ENHANCEMENT_PROMPT = """EXTREME DIRECTIVE 0 v3 — FORENSIC FACE MASK + VERBATIM PIXEL COMPOSITE
 
-COMPOSITION:
-Do not crop, rotate, or alter the framing in any way. Preserve the exact original composition.
+You are acting as a strict forensic photo restoration technician for irreplaceable family history archives. Your only job is to enhance non-face areas while leaving every face 100% untouched at the pixel level.
 
-ENHANCEMENT INSTRUCTIONS (apply to everything except faces):
-- Correct color casts (amber, yellow, blue, magenta) so colors appear natural and balanced.
-- Brighten the overall image and lift shadows so it looks like it was taken with a modern iPhone under good lighting.
-- Boost color vibrance and saturation to make colors vivid, punchy, and rich. Clothing and backgrounds should look especially bold and saturated while remaining photorealistic.
-- Remove yellowing and fading.
-- Remove any remaining scratches, creases, or haze.
-- Sharpen and clarify non-face areas to improve overall image quality.
+MANDATORY INTERNAL WORKFLOW (follow exactly in order):
+Step 1: Detect every human face region in the input image with pixel-level precision. Create a perfect mental mask covering all face areas (skin, eyes, mouth, nose, ears, hairline, neck junction, expression details, shadows, blur, and imperfections).
+Step 2: For the masked face regions ONLY — perform a verbatim, bit-for-bit pixel copy from the input image. Copy the exact RGB values of every face pixel with zero processing, zero interpretation, zero enhancement, zero smoothing, zero sharpening, zero deblurring, and zero regeneration. The faces in the output must be identical to the input at the raw pixel level.
+Step 3: For all NON-masked regions (clothing, background, ground, props, sky, buildings, non-facial hair) apply ONLY the enhancements listed below.
+Step 4: Composite the untouched original face pixels exactly on top of the enhanced non-face layer. Verify that no face pixel has changed in any way. If you cannot complete Step 2 with 100% fidelity, output the original unenhanced photograph instead of producing a compromised version.
 
-TEXT: If a physically printed date or text appears on the original, preserve it exactly. Add no new text or overlays.
+ZERO TOLERANCE RULES:
+- Any detectable change to face pixels (color, sharpness, texture, expression, detail level, blur amount) invalidates the output.
+- If a face is blurry/low-resolution/imperfect in the input, it must stay exactly that way.
+- Faces are exempt from all color, lighting, vibrance, contrast, and sharpening instructions.
 
-Output only the restored photograph."""
+ENHANCEMENTS (NON-FACE AREAS ONLY):
+- Correct color casts and remove yellowing/fading.
+- Brighten and lift shadows to achieve a clean modern iPhone daylight appearance.
+- Boost vibrance and saturation for rich, punchy colors in clothing and backgrounds.
+- Remove dust, scratches, creases, and haze.
+- Sharpen and clarify only non-face areas.
+
+COMPOSITION & OUTPUT:
+- Match the input image dimensions, framing, and aspect ratio exactly.
+- Preserve any physically printed text or dates exactly.
+- Output ONLY the final restored photograph. No text, borders, watermarks, or explanations.
+
+This is archival preservation, not creative enhancement. Follow the workflow strictly."""
 
 # Topaz enhancement prompt (max 1024 characters — condensed version of the xAI prompt)
 TOPAZ_PROMPT = ("Restore this old scanned photograph. "
@@ -173,7 +184,7 @@ def upload_to_drive(service, local_path, filename, folder_id):
     print(f"  Uploaded to Drive: {uploaded['name']}")
     return uploaded
 
-def is_black_and_white(image_path, saturation_threshold=15):
+def is_black_and_white(image_path, saturation_threshold=10):
     """Detect if an image is black and white by checking average color saturation."""
     img = Image.open(image_path).convert('RGB')
     # Sample pixels to check saturation (resize for speed)
@@ -197,7 +208,7 @@ def is_black_and_white(image_path, saturation_threshold=15):
 def apply_dust_removal(input_path, output_path):
     """Apply a median filter to remove dust and scratch specks before AI enhancement."""
     img = Image.open(input_path)
-    result = img.filter(ImageFilter.MedianFilter(size=5))  # size must be odd; 3=subtle, 5=moderate, 7=aggressive
+    result = img.filter(ImageFilter.MedianFilter(size=3))  # size must be odd; 3=subtle, 5=moderate, 7=aggressive
     result.save(output_path, 'JPEG', quality=95)
 
 # ============================================================
@@ -455,9 +466,9 @@ def main():
     print("Authenticating with Google Drive...")
     service = authenticate_drive()
 
-    # Step 3: Extract date prefix from the first scanner file (strip xAI_ prefix if present)
+    # Step 3: Extract date prefix from the first scanner file (strip topaz_ prefix if present)
     first_filename = os.path.basename(local_files[0])
-    first_filename_normalized = first_filename[4:] if first_filename.lower().startswith('xai_') else first_filename
+    first_filename_normalized = first_filename[6:] if first_filename.lower().startswith('topaz_') else first_filename
     date_match = re.match(r'IMG_(\d{8})_', first_filename_normalized)
     if not date_match:
         print(f"ERROR: First file doesn't match expected pattern: {first_filename}")
@@ -472,11 +483,14 @@ def main():
     # would conflict with what's already on Drive
     local_sequences = []
     for f in local_files:
-        m = re.match(r'IMG_\d{8}_(\d{4})\.jpg', os.path.basename(f), re.IGNORECASE)
+        name = os.path.basename(f)
+        if name.lower().startswith('topaz_'):
+            name = name[6:]
+        m = re.match(r'IMG_\d{8}_(\d{4})\.jpg', name, re.IGNORECASE)
         if m:
             local_sequences.append(int(m.group(1)))
 
-    needs_rename = last_seq > 0 and min(local_sequences) <= last_seq
+    needs_rename = last_seq > 0 and bool(local_sequences) and min(local_sequences) <= last_seq
     if needs_rename:
         print(f"Conflict detected: renaming files to start from {last_seq + 1:04d}\n")
     else:
