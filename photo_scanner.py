@@ -350,6 +350,20 @@ FACE_DEDUPE_IOU = 0.4           # boxes overlapping more than this are the same 
 FACE_CHROMA_SMOOTH_PX = 3
 FACE_LUMA_TOLERANCE = 2
 
+# Faces are deliberately excluded from median despeckling (set below 3 = off).
+#
+# Including them was tried, on the theory that the halftone mesh is an artifact of
+# the print rather than of the photograph and so is not worth preserving. It failed
+# on both counts: FFT analysis of a face crop puts the screen at a period of ~8.3px
+# in two orientations (51x and 43x baseline energy), so a 3px median cannot reach it
+# — the mesh survived untouched while gradient correlation against the original
+# collapsed from 0.9612 to 0.5548. Reaching an 8px period spatially would need a
+# ~9px kernel, which on a 165px-wide face destroys the face.
+#
+# Real facial structure occupies periods of 15-55px, well separated from the screen,
+# so a frequency-domain notch is the tool that could remove it selectively.
+FACE_DESPECKLE_PX = 0
+
 _FACE_ANALYZERS = {}
 
 
@@ -566,12 +580,21 @@ def smooth_face_chroma(image_bgr, radius=FACE_CHROMA_SMOOTH_PX):
 
 
 def build_face_layer(original_bgr, lut):
-    """The complete, deterministic face transform: tone-grade, then smooth chroma.
+    """The complete, deterministic face transform, derived only from the raw scan:
+    despeckle, tone-grade, then smooth chroma.
 
     Kept in one function so Stage 4 can recompute it independently and compare the
-    result byte-for-byte against what actually got written.
+    result byte-for-byte against what actually got written. No step here can
+    introduce content that was not already in the scan.
     """
-    return smooth_face_chroma(apply_tone_transfer(original_bgr, lut))
+    return smooth_face_chroma(apply_tone_transfer(_face_source(original_bgr), lut))
+
+
+def _face_source(original_bgr):
+    """The raw scan, optionally despeckled — the sole origin of every face pixel."""
+    if FACE_DESPECKLE_PX >= 3:
+        return cv2.medianBlur(original_bgr, FACE_DESPECKLE_PX)
+    return original_bgr
 
 
 def grade_and_composite(original_bgr, enhanced_bgr, strict_mask, alpha, lut):
@@ -621,7 +644,7 @@ def verify_face_grade(original_bgr, final_bgr, strict_mask, lut):
     if not core.any():
         return monotonic, 0, monotonic, 0
 
-    graded = apply_tone_transfer(original_bgr, lut)
+    graded = apply_tone_transfer(_face_source(original_bgr), lut)
     expected = smooth_face_chroma(graded)
 
     # Did smoothing disturb luminance anywhere in the face?
