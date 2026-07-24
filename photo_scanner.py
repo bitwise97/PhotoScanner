@@ -522,10 +522,13 @@ def apply_masked_dust_removal(image_bgr, strict_mask):
 def enhance_via_xai_array(image_bgr, work_path):
     """Stage 2 — round-trip an image array through xAI and return the enhanced array.
 
-    xAI is generative and may return different dimensions, so the result is resized
-    back to the input dimensions to keep the mask aligned. Returns None on failure.
+    The result is returned at whatever resolution xAI produced, which is typically
+    well below the scan's. It is deliberately NOT upscaled: everything downstream
+    works at xAI's resolution instead, so the enhanced pixels are never resampled and
+    the `_ai` output stays the size it used to be before this pipeline existed.
+
+    Returns None on failure.
     """
-    h, w = image_bgr.shape[:2]
     stage_in = work_path + '_stage2_in.jpg'
     stage_out = work_path + '_stage2_out.jpg'
 
@@ -538,11 +541,6 @@ def enhance_via_xai_array(image_bgr, work_path):
         if enhanced is None:
             print(f"  ERROR: Could not read the image xAI returned")
             return None
-
-        if enhanced.shape[:2] != (h, w):
-            print(f"  xAI returned {enhanced.shape[1]}x{enhanced.shape[0]}, "
-                  f"resizing to {w}x{h} to realign with the mask")
-            enhanced = cv2.resize(enhanced, (w, h), interpolation=cv2.INTER_LANCZOS4)
 
         return enhanced
     finally:
@@ -712,9 +710,9 @@ def smooth_face_chroma(image_bgr, radius=FACE_CHROMA_SMOOTH_PX):
     return cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
 
 
-def build_face_layer(original_bgr, lut, boxes):
-    """The complete, deterministic face transform, derived only from the raw scan:
-    descreen, tone-grade, then smooth chroma. Returns (layer, worst_detail_loss).
+def build_face_layer(face_source_bgr, lut):
+    """The deterministic face transform applied at working resolution: tone-grade,
+    then smooth chroma. Takes the output of prepare_face_source().
 
     Kept in one function so Stage 4 can recompute it independently and compare the
     result byte-for-byte against what actually got written. No step here can
@@ -722,20 +720,31 @@ def build_face_layer(original_bgr, lut, boxes):
     monotonic curve are both subtractive, and chroma smoothing leaves luminance
     untouched.
     """
-    source, detail_loss = _face_source(original_bgr, boxes)
-    return smooth_face_chroma(apply_tone_transfer(source, lut)), detail_loss
+    return smooth_face_chroma(apply_tone_transfer(face_source_bgr, lut))
 
 
-def _face_source(original_bgr, boxes):
-    """The raw scan, descreened and optionally despeckled — the sole origin of
-    every face pixel. Returns (image, worst_detail_loss)."""
+def prepare_face_source(original_bgr, boxes, work_size):
+    """Build the image every face pixel ultimately comes from.
+
+    Descreening and despeckling run at the scan's full resolution, because the
+    halftone screen sits at ~8px there — after a 2x downscale it would fall to ~4px
+    and the notch band would have to chase it. The result is then resampled once to
+    `work_size`, the resolution xAI returned, using INTER_AREA (area averaging, the
+    correct choice for downscaling).
+
+    Returns (source_at_work_size, worst_detail_loss).
+    """
     source = original_bgr
     if FACE_DESPECKLE_PX >= 3:
         source = cv2.medianBlur(source, FACE_DESPECKLE_PX)
-    return descreen_faces(source, boxes)
+    source, detail_loss = descreen_faces(source, boxes)
+
+    if (source.shape[1], source.shape[0]) != tuple(work_size):
+        source = cv2.resize(source, tuple(work_size), interpolation=cv2.INTER_AREA)
+    return source, detail_loss
 
 
-def grade_and_composite(original_bgr, enhanced_bgr, strict_mask, alpha, lut, boxes):
+def grade_and_composite(face_source_bgr, enhanced_bgr, strict_mask, alpha, lut):
     """Stage 3 — composite tone-graded ORIGINAL face pixels onto the enhanced image.
 
     Face pixels come from the original scan, mapped through the global curve derived
@@ -748,7 +757,7 @@ def grade_and_composite(original_bgr, enhanced_bgr, strict_mask, alpha, lut, box
     overwritten with the graded original so no blending or rounding can mix in
     enhanced-image content.
     """
-    graded, _ = build_face_layer(original_bgr, lut, boxes)
+    graded = build_face_layer(face_source_bgr, lut)
 
     a = alpha[..., None]
     blended = graded.astype(np.float32) * a + enhanced_bgr.astype(np.float32) * (1.0 - a)
@@ -759,7 +768,7 @@ def grade_and_composite(original_bgr, enhanced_bgr, strict_mask, alpha, lut, box
     return result
 
 
-def verify_face_grade(original_bgr, final_bgr, strict_mask, lut, boxes):
+def verify_face_grade(face_source_bgr, final_bgr, strict_mask, lut, detail_loss):
     """Stage 4 — confirm faces are the original pixels under a tone curve and a
     chroma-only smooth, and nothing else.
 
@@ -784,10 +793,9 @@ def verify_face_grade(original_bgr, final_bgr, strict_mask, lut, boxes):
 
     core = strict_mask > 0
     if not core.any():
-        return monotonic, 0, monotonic, 0, 0.0
+        return monotonic, 0, monotonic, 0, detail_loss
 
-    source, detail_loss = _face_source(original_bgr, boxes)
-    graded = apply_tone_transfer(source, lut)
+    graded = apply_tone_transfer(face_source_bgr, lut)
     expected = smooth_face_chroma(graded)
 
     # Did smoothing disturb luminance anywhere in the face?
@@ -806,9 +814,13 @@ def verify_face_grade(original_bgr, final_bgr, strict_mask, lut, boxes):
 def enhance_photo_pipeline(input_path: str, output_path: str) -> bool:
     """Enhance a photo while guaranteeing human faces are unchanged at the pixel level.
 
-    Runs the four stages against the raw scan, verifies the result on a lossless PNG,
-    then writes `output_path` as JPEG and discards the PNG. The input file is never
-    modified. Returns True on success, False on any hard error or failed verification.
+    Faces are detected and descreened at the scan's full resolution, then everything
+    is composited at whatever resolution xAI returned — the enhanced pixels are never
+    upscaled, so the output matches the size xAI produced rather than the scan's. The
+    result is verified on a lossless PNG, written as JPEG, and the PNG discarded. The
+    input file is never modified.
+
+    Returns True on success, False on any hard error or failed verification.
     """
     original = cv2.imread(input_path, cv2.IMREAD_COLOR)
     if original is None:
@@ -849,12 +861,35 @@ def enhance_photo_pipeline(input_path: str, output_path: str) -> bool:
         print(f"  Enhanced image saved: {os.path.basename(output_path)}")
         return True
 
+    # Everything downstream works at xAI's output resolution rather than upscaling
+    # its result to the scan's. That keeps the enhanced pixels unresampled and keeps
+    # the _ai file the size it has always been. The cost is that face pixels are
+    # area-averaged down to this resolution — still derived solely from the scan, but
+    # no longer at its native detail.
+    work_h, work_w = enhanced.shape[:2]
+    if (work_h, work_w) != (h, w):
+        print(f"  xAI returned {work_w}x{work_h}; compositing at that resolution "
+              f"(scan is {w}x{h})")
+        strict_work = cv2.resize(strict_mask, (work_w, work_h), interpolation=cv2.INTER_NEAREST)
+        alpha_work = cv2.resize(alpha, (work_w, work_h), interpolation=cv2.INTER_LINEAR)
+    else:
+        strict_work, alpha_work = strict_mask, alpha
+
+    if not strict_work.any():
+        # Every face shrank below a pixel — nothing left to protect or verify.
+        print(f"  WARNING: face mask vanished at {work_w}x{work_h}; saving enhanced result")
+        cv2.imwrite(output_path, enhanced, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        return True
+
+    # Descreening runs at full scan resolution, then the source is resampled once.
+    face_source, detail_loss = prepare_face_source(original, boxes, (work_w, work_h))
+
     # ---- Stage 3: graded composite ----
     # The tone curve is fitted only where alpha is 0 — the untouched enhanced
     # region — so neither face pixels nor the feathered ring skew the fit.
     print(f"  Stage 3: grading and compositing original face pixels...")
-    lut = compute_tone_transfer(original, enhanced, alpha == 0)
-    final = grade_and_composite(original, enhanced, strict_mask, alpha, lut, boxes)
+    lut = compute_tone_transfer(face_source, enhanced, alpha_work == 0)
+    final = grade_and_composite(face_source, enhanced, strict_work, alpha_work, lut)
 
     # ---- Stage 4: verification on a lossless PNG ----
     # JPEG would recompress the composite and invalidate a byte-exact check, so the
@@ -871,7 +906,7 @@ def enhance_photo_pipeline(input_path: str, output_path: str) -> bool:
             return False
 
         ok, changed, monotonic, luma_dev, detail_loss = verify_face_grade(
-            original, reloaded, strict_mask, lut, boxes)
+            face_source, reloaded, strict_work, lut, detail_loss)
         if not ok:
             if not monotonic:
                 print(f"  WARNING: Verification FAILED — tone curve is not monotonic, "
