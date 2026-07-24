@@ -345,10 +345,16 @@ FACE_DEDUPE_IOU = 0.4           # boxes overlapping more than this are the same 
 #
 # Smoothing chroma alone removes the color mesh while leaving luminance — which
 # carries essentially all perceived detail — completely untouched. Set below 3 to
-# disable. FACE_LUMA_TOLERANCE absorbs YCrCb/BGR round-trip rounding when Stage 4
-# checks that the smoothing really was chroma-only.
+# disable.
+#
+# The tolerance is 0 because smooth_face_chroma enforces exact luminance rather than
+# approximating it: pixels whose chroma cannot move without gamut clipping shifting
+# their luminance keep their original chroma instead. This was originally 2, chosen
+# from a single photo, and real scans with stronger colour then failed verification
+# at deviations of 3 and 4 — a false failure, since luminance was never the thing
+# actually changing. Enforcing the invariant is both stricter and correct.
 FACE_CHROMA_SMOOTH_PX = 3
-FACE_LUMA_TOLERANCE = 2
+FACE_LUMA_TOLERANCE = 0
 
 # Faces are deliberately excluded from median despeckling (set below 3 = off).
 #
@@ -705,9 +711,26 @@ def smooth_face_chroma(image_bgr, radius=FACE_CHROMA_SMOOTH_PX):
         return image_bgr.copy()
 
     ycrcb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2YCrCb)
+    target_luma = ycrcb[..., 0].copy()
     ycrcb[..., 1] = cv2.medianBlur(ycrcb[..., 1], radius)
     ycrcb[..., 2] = cv2.medianBlur(ycrcb[..., 2], radius)
-    return cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+    result = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+
+    # Copying Y verbatim is not by itself enough to preserve luminance. Moving Cr/Cb
+    # can push a highly saturated pixel outside the RGB cube; the conversion back
+    # clips it into range, and clipping shifts luminance. Measured on real scans this
+    # affected a handful of pixels by up to 3-4 levels — enough to fail verification.
+    #
+    # Those pixels simply keep their original chroma, which is in gamut by
+    # construction, so luminance is preserved exactly everywhere rather than
+    # approximately. The cost is that a few of the most saturated pixels go
+    # unsmoothed, which is invisible next to losing the guarantee.
+    actual_luma = cv2.cvtColor(result, cv2.COLOR_BGR2YCrCb)[..., 0]
+    clipped = actual_luma != target_luma
+    if clipped.any():
+        result[clipped] = image_bgr[clipped]
+
+    return result
 
 
 def build_face_layer(face_source_bgr, lut):
