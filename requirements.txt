@@ -1,0 +1,17 @@
+# Image processing
+Pillow
+numpy
+opencv-python
+
+# Face detection / segmentation for the face-preserving pipeline
+insightface
+onnxruntime
+
+# HTTP
+requests
+
+# Google Drive
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2

@@ -4,14 +4,21 @@
 # Automatically detects black & white photos and produces a grayscale-enhanced
 # version alongside the color-enhanced version, using the Pillow image library.
 #
-# Enhancement pipeline: Pillow MedianFilter removes dust first, then xAI enhances
-# color, exposure, and sharpness to produce a modern-looking result.
+# Enhancement pipeline (default, xAI): a 4-stage face-preserving pipeline guarantees
+# human faces are unchanged at the pixel level rather than relying on prompt wording.
+#   Stage 1  InsightFace detects every face and builds a pixel-precise mask.
+#   Stage 2  Dust removal runs outside the mask only, then xAI enhances the image.
+#   Stage 3  The exact original face pixels are composited back over the result,
+#            with a soft transition ring just outside the strict face area.
+#   Stage 4  The composite is verified byte-for-byte as a lossless PNG; the PNG is
+#            then converted to the final JPEG and discarded.
+# If verification fails, the photo is treated as a failure: nothing is uploaded and
+# the local file is kept so it can be retried or routed through Topaz.
 #
-# Enhancement pipeline: Pillow dust removal (MedianFilter size=5) runs first on every
-# file, then the result is sent to xAI for color correction and enhancement.
 # Topaz fallback: To route a specific file through Topaz instead of xAI, prefix the
 # filename with 'topaz_' before dropping it in ~/Pictures, e.g.:
 #   topaz_IMG_20260702_0015.jpg  →  processed by Topaz  →  IMG_20260702_0015_ai.jpg
+# The Topaz path uses whole-image dust removal and is not face-masked.
 #
 # Usage:
 #   python photo_scanner.py [--folder-id <DRIVE_FOLDER_ID>]
@@ -56,6 +63,8 @@ import glob
 import base64
 import requests
 import time
+import cv2
+import numpy as np
 from PIL import Image, ImageFilter
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -80,35 +89,43 @@ SCANNER_OUTPUT = '/Users/sreynoso/Pictures'
 TOPAZ_API_KEY = None
 XAI_API_KEY = None
 
-# xAI enhancement prompt
-ENHANCEMENT_PROMPT = """EXTREME DIRECTIVE 0 v3 — FORENSIC FACE MASK + VERBATIM PIXEL COMPOSITE
+# xAI enhancement prompt.
+#
+# Face preservation is NOT the job of this prompt — Stages 1/3/4 of
+# enhance_photo_pipeline() enforce that mechanically by compositing the original
+# face pixels back and verifying them byte-for-byte. Faces are mentioned here only
+# to discourage the model from repositioning or rescaling heads, since geometric
+# drift is what makes the Stage 3 composite misalign.
+#
+# The prompt's real job is color fidelity. Asking for "vivid, punchy" colors and
+# calling out clothing by name reliably produced invented colors (a gray shirt
+# coming back saturated blue), so the saturation instruction is deliberately
+# bounded to recovering what fading removed, and hue changes are forbidden outright.
+ENHANCEMENT_PROMPT = """Restore this scanned photograph. This is archival family history: the goal is faithful restoration, not creative reinterpretation.
 
-You are acting as a strict forensic photo restoration technician for irreplaceable family history archives. Your only job is to enhance non-face areas while leaving every face 100% untouched at the pixel level.
+WHAT TO FIX:
+- Remove the overall color cast (amber, yellow, blue, or magenta) left by film aging, as a single global white-balance correction applied evenly across the whole image.
+- Correct exposure and lift shadows so the scene reads as evenly and naturally lit.
+- Remove dust, specks, scratches, creases, and haze.
+- Restore the contrast and clarity that fading has cost the image.
 
-MANDATORY INTERNAL WORKFLOW (follow exactly in order):
-Step 1: Detect every human face region in the input image with pixel-level precision. Create a perfect mental mask covering all face areas (skin, eyes, mouth, nose, ears, hairline, neck junction, expression details, shadows, blur, and imperfections).
-Step 2: For the masked face regions ONLY — perform a verbatim, bit-for-bit pixel copy from the input image. Copy the exact RGB values of every face pixel with zero processing, zero interpretation, zero enhancement, zero smoothing, zero sharpening, zero deblurring, and zero regeneration. The faces in the output must be identical to the input at the raw pixel level.
-Step 3: For all NON-masked regions (clothing, background, ground, props, sky, buildings, non-facial hair) apply ONLY the enhancements listed below.
-Step 4: Composite the untouched original face pixels exactly on top of the enhanced non-face layer. Verify that no face pixel has changed in any way. If you cannot complete Step 2 with 100% fidelity, output the original unenhanced photograph instead of producing a compromised version.
+COLOR FIDELITY — THIS IS THE PRIORITY:
+Every object must keep its original color identity. Correct the cast; do not repaint the subject.
+- Do not change the hue of anything. A gray shirt stays gray. A brown floor stays brown. A white wall stays white.
+- Neutral objects stay neutral. Never add color to something that is gray, white, or black.
+- Recover saturation only to the degree that fading removed it. Do not exceed the saturation an ordinary, well-exposed photograph of this scene would have had.
+- Do not make colors vivid, punchy, bold, or rich. Natural and accurate is correct; striking is wrong.
+- If you are unsure what color something originally was, leave it exactly as it is.
 
-ZERO TOLERANCE RULES:
-- Any detectable change to face pixels (color, sharpness, texture, expression, detail level, blur amount) invalidates the output.
-- If a face is blurry/low-resolution/imperfect in the input, it must stay exactly that way.
-- Faces are exempt from all color, lighting, vibrance, contrast, and sharpening instructions.
+GEOMETRY:
+- Keep the exact framing, aspect ratio, and placement. Do not crop, rotate, zoom, or reposition anything.
+- Keep every person and object at its original position, scale, and pose. Heads in particular must not move or change size.
+- Do not add, remove, or substitute any object, person, or background element.
 
-ENHANCEMENTS (NON-FACE AREAS ONLY):
-- Correct color casts and remove yellowing/fading.
-- Brighten and lift shadows to achieve a clean modern iPhone daylight appearance.
-- Boost vibrance and saturation for rich, punchy colors in clothing and backgrounds.
-- Remove dust, scratches, creases, and haze.
-- Sharpen and clarify only non-face areas.
+TEXT:
+- Preserve any physically printed date or text exactly. Add no text, borders, or watermarks.
 
-COMPOSITION & OUTPUT:
-- Match the input image dimensions, framing, and aspect ratio exactly.
-- Preserve any physically printed text or dates exactly.
-- Output ONLY the final restored photograph. No text, borders, watermarks, or explanations.
-
-This is archival preservation, not creative enhancement. Follow the workflow strictly."""
+Output only the restored photograph."""
 
 # Topaz enhancement prompt (max 1024 characters — condensed version of the xAI prompt)
 TOPAZ_PROMPT = ("Restore this old scanned photograph. "
@@ -272,6 +289,255 @@ def enhance_with_xai(input_path, output_path):
     print(f"  ERROR: Unexpected response format from xAI")
     print(f"  Response: {result}")
     return False
+
+
+# ============================================================
+# FACE-PRESERVING ENHANCEMENT PIPELINE (4 STAGES)
+# ============================================================
+#
+# The single-call xAI approach relied on prompt instructions to leave faces
+# alone. This pipeline enforces that guarantee mechanically instead:
+#
+#   Stage 1  Detect faces and build a pixel-precise mask.
+#   Stage 2  Enhance the image via xAI (faces are protected from dust removal
+#            beforehand, and overwritten afterward regardless of what xAI did).
+#   Stage 3  Composite the exact original face pixels back onto the result.
+#   Stage 4  Verify no face pixel changed; fail loudly if any did.
+#
+# Face pixels are guaranteed against the RAW scan — dust removal is applied
+# only outside the mask, so facial texture is never median-filtered.
+
+# Mask geometry, expressed as a fraction of each face's diagonal so the mask
+# scales with face size rather than image resolution.
+FACE_HULL_DILATE_RATIO = 0.08   # grow the landmark hull to cover hairline and neck junction
+FACE_FEATHER_RATIO = 0.06       # width of the soft transition ring OUTSIDE the strict mask
+
+_FACE_ANALYZER = None
+
+
+def _get_face_analyzer():
+    """Lazily build the InsightFace analyzer. Models download once to ~/.insightface."""
+    global _FACE_ANALYZER
+    if _FACE_ANALYZER is None:
+        from insightface.app import FaceAnalysis
+        print("  Loading InsightFace model (first run downloads ~300MB)...")
+        analyzer = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+        analyzer.prepare(ctx_id=-1, det_size=(640, 640))
+        _FACE_ANALYZER = analyzer
+    return _FACE_ANALYZER
+
+
+def _odd(n):
+    """Round up to the nearest odd integer >= 1 (OpenCV kernels must be odd)."""
+    n = max(1, int(round(n)))
+    return n if n % 2 == 1 else n + 1
+
+
+def generate_face_mask(image_bgr):
+    """Stage 1 — detect every face and build the strict and feathered masks.
+
+    Returns (strict_mask, alpha, boxes):
+      strict_mask  uint8 {0,255}  core face area; these pixels are copied verbatim
+      alpha        float32 [0,1]  1.0 inside strict_mask, ramping to 0 across a ring
+                                  just outside it, 0 everywhere else
+      boxes        list of (x1, y1, x2, y2) bounding boxes, for logging
+    """
+    h, w = image_bgr.shape[:2]
+    strict_mask = np.zeros((h, w), dtype=np.uint8)
+    boxes = []
+
+    faces = _get_face_analyzer().get(image_bgr)
+
+    feather_px = 1  # grows with the largest face found; 1 keeps GaussianBlur valid if none are
+    for face in faces:
+        x1, y1, x2, y2 = [int(v) for v in face.bbox]
+        boxes.append((x1, y1, x2, y2))
+
+        # Prefer the dense 106-point contour; fall back to the 5-point kps, then the
+        # bounding box, so partial or low-quality faces still get covered.
+        points = getattr(face, 'landmark_2d_106', None)
+        if points is None:
+            points = getattr(face, 'kps', None)
+        if points is None:
+            points = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+        points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+
+        face_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillConvexPoly(face_mask, cv2.convexHull(points.astype(np.int32)), 255)
+
+        # Landmarks trace the face contour but stop short of the hairline and the
+        # neck junction, so grow the hull outward proportionally to face size.
+        diag = float(np.hypot(x2 - x1, y2 - y1))
+        grow = _odd(diag * FACE_HULL_DILATE_RATIO)
+        face_mask = cv2.dilate(face_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow, grow)))
+
+        strict_mask = cv2.bitwise_or(strict_mask, face_mask)
+        feather_px = max(feather_px, _odd(diag * FACE_FEATHER_RATIO))
+
+    if not faces:
+        return strict_mask, np.zeros((h, w), dtype=np.float32), boxes
+
+    # Build the alpha ramp in the ring OUTSIDE the strict mask. Blurring a dilated
+    # copy keeps the ramp entirely outside the core, and forcing alpha to 1.0 across
+    # the strict area guarantees those pixels take no contribution from the enhanced
+    # image even before the verbatim copy in Stage 3.
+    ring = cv2.dilate(strict_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (feather_px, feather_px)))
+    alpha = cv2.GaussianBlur(ring.astype(np.float32) / 255.0, (feather_px, feather_px), 0)
+    alpha[strict_mask > 0] = 1.0
+
+    return strict_mask, alpha, boxes
+
+
+def apply_masked_dust_removal(image_bgr, strict_mask):
+    """Median-filter the image everywhere except the strict face area.
+
+    Faces keep their raw scan texture; dust and specks elsewhere are smoothed.
+    """
+    filtered = cv2.medianBlur(image_bgr, 3)
+    core = strict_mask > 0
+    filtered[core] = image_bgr[core]
+    return filtered
+
+
+def enhance_via_xai_array(image_bgr, work_path):
+    """Stage 2 — round-trip an image array through xAI and return the enhanced array.
+
+    xAI is generative and may return different dimensions, so the result is resized
+    back to the input dimensions to keep the mask aligned. Returns None on failure.
+    """
+    h, w = image_bgr.shape[:2]
+    stage_in = work_path + '_stage2_in.jpg'
+    stage_out = work_path + '_stage2_out.jpg'
+
+    try:
+        cv2.imwrite(stage_in, image_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        if not enhance_with_xai(stage_in, stage_out):
+            return None
+
+        enhanced = cv2.imread(stage_out, cv2.IMREAD_COLOR)
+        if enhanced is None:
+            print(f"  ERROR: Could not read the image xAI returned")
+            return None
+
+        if enhanced.shape[:2] != (h, w):
+            print(f"  xAI returned {enhanced.shape[1]}x{enhanced.shape[0]}, "
+                  f"resizing to {w}x{h} to realign with the mask")
+            enhanced = cv2.resize(enhanced, (w, h), interpolation=cv2.INTER_LANCZOS4)
+
+        return enhanced
+    finally:
+        for temp in (stage_in, stage_out):
+            if os.path.exists(temp):
+                os.remove(temp)
+
+
+def strict_composite(original_bgr, enhanced_bgr, strict_mask, alpha):
+    """Stage 3 — paste the exact original face pixels onto the enhanced image.
+
+    The alpha ramp smooths the transition in the ring outside the strict mask, then
+    the strict area is overwritten with a verbatim integer copy so no blending or
+    float rounding can touch a core face pixel.
+    """
+    a = alpha[..., None]
+    blended = original_bgr.astype(np.float32) * a + enhanced_bgr.astype(np.float32) * (1.0 - a)
+    result = np.clip(np.rint(blended), 0, 255).astype(np.uint8)
+
+    core = strict_mask > 0
+    result[core] = original_bgr[core]
+    return result
+
+
+def verify_face_pixels(original_bgr, final_bgr, strict_mask):
+    """Stage 4 — confirm every strict-mask pixel is byte-identical to the original.
+
+    Returns (ok, changed_pixel_count).
+    """
+    core = strict_mask > 0
+    if not core.any():
+        return True, 0
+
+    diff = cv2.absdiff(original_bgr, final_bgr).max(axis=2)
+    changed = int(np.count_nonzero((diff > 0) & core))
+    return changed == 0, changed
+
+
+def enhance_photo_pipeline(input_path: str, output_path: str) -> bool:
+    """Enhance a photo while guaranteeing human faces are unchanged at the pixel level.
+
+    Runs the four stages against the raw scan, verifies the result on a lossless PNG,
+    then writes `output_path` as JPEG and discards the PNG. The input file is never
+    modified. Returns True on success, False on any hard error or failed verification.
+    """
+    original = cv2.imread(input_path, cv2.IMREAD_COLOR)
+    if original is None:
+        print(f"  ERROR: Could not read {os.path.basename(input_path)}")
+        return False
+
+    h, w = original.shape[:2]
+    png_path = os.path.splitext(output_path)[0] + '.png'
+
+    # ---- Stage 1: face mask ----
+    print(f"  Stage 1: detecting faces...")
+    try:
+        strict_mask, alpha, boxes = generate_face_mask(original)
+    except Exception as e:
+        print(f"  ERROR: Face detection failed: {e}")
+        return False
+
+    if boxes:
+        coverage = 100.0 * np.count_nonzero(strict_mask) / (h * w)
+        print(f"  Stage 1: {len(boxes)} face(s) masked, {coverage:.1f}% of image protected")
+        for i, (x1, y1, x2, y2) in enumerate(boxes, 1):
+            print(f"    face {i}: ({x1},{y1})-({x2},{y2})")
+    else:
+        print(f"  Stage 1: no faces detected — enhancing the whole image")
+
+    # ---- Stage 2: enhancement ----
+    # Faces are excluded from dust removal so their guarantee holds against the raw scan.
+    print(f"  Stage 2: dust removal (outside faces) + xAI enhancement...")
+    prepared = apply_masked_dust_removal(original, strict_mask)
+    enhanced = enhance_via_xai_array(prepared, os.path.splitext(output_path)[0])
+    if enhanced is None:
+        print(f"  ERROR: Stage 2 enhancement failed")
+        return False
+
+    # With no faces there is nothing to protect, so the enhanced result stands as-is.
+    if not boxes:
+        cv2.imwrite(output_path, enhanced, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        print(f"  Enhanced image saved: {os.path.basename(output_path)}")
+        return True
+
+    # ---- Stage 3: strict composite ----
+    print(f"  Stage 3: compositing original face pixels...")
+    final = strict_composite(original, enhanced, strict_mask, alpha)
+
+    # ---- Stage 4: verification on a lossless PNG ----
+    # JPEG would recompress the composite and invalidate a byte-exact check, so the
+    # result is verified as PNG and only then written out as the JPEG deliverable.
+    print(f"  Stage 4: verifying face pixels...")
+    if not cv2.imwrite(png_path, final):
+        print(f"  ERROR: Could not write verification PNG")
+        return False
+
+    try:
+        reloaded = cv2.imread(png_path, cv2.IMREAD_COLOR)
+        if reloaded is None:
+            print(f"  ERROR: Could not read back verification PNG")
+            return False
+
+        ok, changed = verify_face_pixels(original, reloaded, strict_mask)
+        if not ok:
+            print(f"  WARNING: Verification FAILED — {changed} face pixel(s) changed. "
+                  f"Discarding enhanced result.")
+            return False
+
+        print(f"  Stage 4: verified — 0 face pixels changed")
+        cv2.imwrite(output_path, reloaded, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        print(f"  Enhanced image saved: {os.path.basename(output_path)}")
+        return True
+    finally:
+        if os.path.exists(png_path):
+            os.remove(png_path)
 
 
 # ============================================================
@@ -448,9 +714,11 @@ def main():
     ]
     local_files = sorted(set(f for p in patterns for f in glob.glob(p)))
 
-    # Filter out any _ai or _dr (dust-removal temp) files that might be lingering
+    # Filter out any _ai, _dr (dust-removal temp), or _stage2_ (pipeline temp) files
+    # that might be lingering from an interrupted run
     local_files = [f for f in local_files if '_ai.' not in os.path.basename(f).lower()
-                   and '_dr.' not in os.path.basename(f).lower()]
+                   and '_dr.' not in os.path.basename(f).lower()
+                   and '_stage2_' not in os.path.basename(f).lower()]
 
     # Remove duplicates
     local_files = sorted(set(local_files))
@@ -546,22 +814,20 @@ def main():
         if is_bw:
             print(f"  Detected as black & white image")
 
-        # Step 1: Dust removal pre-processing (always runs, output is a temp file)
-        dust_removed_path = new_path.replace('.jpg', '_dr.jpg').replace('.JPG', '_dr.jpg')
-        print(f"  Applying dust removal (MedianFilter size=5)...")
-        apply_dust_removal(new_path, dust_removed_path)
-
-        # Step 2: Route to xAI (default) or Topaz (topaz_ prefix) for enhancement
+        # Route to the face-preserving xAI pipeline (default) or Topaz (topaz_ prefix)
         ai_path = os.path.join(SCANNER_OUTPUT, ai_filename)
         if use_topaz:
+            # Topaz path is unchanged: whole-image dust removal, then Topaz.
+            dust_removed_path = new_path.replace('.jpg', '_dr.jpg').replace('.JPG', '_dr.jpg')
+            print(f"  Applying dust removal (MedianFilter size=3)...")
+            apply_dust_removal(new_path, dust_removed_path)
             print(f"  Using Topaz (fallback requested via filename prefix)")
             success = enhance_with_topaz(dust_removed_path, ai_path)
+            if os.path.exists(dust_removed_path):
+                os.remove(dust_removed_path)
         else:
-            success = enhance_with_xai(dust_removed_path, ai_path)
-
-        # Clean up temp dust-removal file
-        if os.path.exists(dust_removed_path):
-            os.remove(dust_removed_path)
+            # 4-stage pipeline; it applies its own face-masked dust removal internally.
+            success = enhance_photo_pipeline(new_path, ai_path)
 
         if success:
             # Upload both the original and enhanced version to Drive
