@@ -8,7 +8,8 @@
 # human faces are unchanged at the pixel level rather than relying on prompt wording.
 #   Stage 1  InsightFace detects every face and builds a pixel-precise mask.
 #   Stage 2  Dust removal runs outside the mask only, then xAI enhances the image.
-#   Stage 3  The exact original face pixels are composited back over the result,
+#   Stage 3  The original face pixels are composited back over the result, graded
+#            through the same global tone curve the enhancement applied elsewhere,
 #            with a soft transition ring just outside the strict face area.
 #   Stage 4  The composite is verified byte-for-byte as a lossless PNG; the PNG is
 #            then converted to the final JPEG and discarded.
@@ -301,11 +302,22 @@ def enhance_with_xai(input_path, output_path):
 #   Stage 1  Detect faces and build a pixel-precise mask.
 #   Stage 2  Enhance the image via xAI (faces are protected from dust removal
 #            beforehand, and overwritten afterward regardless of what xAI did).
-#   Stage 3  Composite the exact original face pixels back onto the result.
-#   Stage 4  Verify no face pixel changed; fail loudly if any did.
+#   Stage 3  Fit the global tone curve the enhancement applied to the rest of the
+#            photo, and composite the ORIGINAL face pixels back through it.
+#   Stage 4  Verify the faces equal the graded original byte-for-byte under a
+#            monotonic curve; fail loudly otherwise.
 #
-# Face pixels are guaranteed against the RAW scan — dust removal is applied
-# only outside the mask, so facial texture is never median-filtered.
+# Face pixels always derive from the RAW scan — dust removal is applied only
+# outside the mask, so facial texture is never median-filtered.
+#
+# Stage 3 originally pasted the face pixels back completely unmodified. That is a
+# stronger-sounding guarantee and it verified perfectly, but on a badly faded scan
+# it produced orange face-shaped patches on otherwise correctly graded people: the
+# background moved by a mean of 92.8 levels while the faces moved by 0. Grading the
+# original pixels through the same curve keeps what actually matters — no AI ever
+# redraws a face — while letting faces sit in register with the restored photo. A
+# per-channel monotonic LUT cannot invent a feature, smooth skin, or sharpen an
+# edge; it can only move color and tone.
 
 # Mask geometry, expressed as a fraction of each face's diagonal so the mask
 # scales with face size rather than image resolution.
@@ -490,34 +502,90 @@ def enhance_via_xai_array(image_bgr, work_path):
                 os.remove(temp)
 
 
-def strict_composite(original_bgr, enhanced_bgr, strict_mask, alpha):
-    """Stage 3 — paste the exact original face pixels onto the enhanced image.
+def compute_tone_transfer(original_bgr, enhanced_bgr, fit_mask):
+    """Derive the global per-channel tone curve the enhancement applied.
 
-    The alpha ramp smooths the transition in the ring outside the strict mask, then
-    the strict area is overwritten with a verbatim integer copy so no blending or
-    float rounding can touch a core face pixel.
+    Fitted by histogram matching over `fit_mask` — the non-face region — so it
+    describes the grade xAI applied to the rest of the photograph. Because the fit
+    uses tonal distributions rather than pixel correspondence, it is unaffected by
+    the geometric drift a generative model introduces.
+
+    Returns a (256, 3) uint8 LUT, one monotonic curve per BGR channel.
     """
+    lut = np.zeros((256, 3), dtype=np.uint8)
+    levels = np.arange(256)
+
+    for c in range(3):
+        src_cdf = np.cumsum(np.bincount(original_bgr[..., c][fit_mask], minlength=256).astype(np.float64))
+        dst_cdf = np.cumsum(np.bincount(enhanced_bgr[..., c][fit_mask], minlength=256).astype(np.float64))
+        if src_cdf[-1] == 0 or dst_cdf[-1] == 0:
+            lut[:, c] = levels  # nothing to fit; identity
+            continue
+        src_cdf /= src_cdf[-1]
+        dst_cdf /= dst_cdf[-1]
+        # For each source level, the enhanced level sitting at the same quantile.
+        lut[:, c] = np.clip(np.rint(np.interp(src_cdf, dst_cdf, levels)), 0, 255).astype(np.uint8)
+
+    return lut
+
+
+def apply_tone_transfer(image_bgr, lut):
+    """Map an image through a (256, 3) per-channel LUT."""
+    out = np.empty_like(image_bgr)
+    for c in range(3):
+        out[..., c] = lut[:, c][image_bgr[..., c]]
+    return out
+
+
+def grade_and_composite(original_bgr, enhanced_bgr, strict_mask, alpha, lut):
+    """Stage 3 — composite tone-graded ORIGINAL face pixels onto the enhanced image.
+
+    Face pixels come from the original scan, mapped through the global curve derived
+    from the rest of the photo. Nothing is regenerated: the mapping is per-pixel and
+    per-channel, so grain, texture, expressions, and every spatial relationship in
+    the face survive intact — only color and tone move, bringing faces into register
+    with the corrected background instead of leaving them as raw amber patches.
+
+    The alpha ramp smooths the ring outside the strict mask; the strict area is then
+    overwritten with the graded original so no blending or rounding can mix in
+    enhanced-image content.
+    """
+    graded = apply_tone_transfer(original_bgr, lut)
+
     a = alpha[..., None]
-    blended = original_bgr.astype(np.float32) * a + enhanced_bgr.astype(np.float32) * (1.0 - a)
+    blended = graded.astype(np.float32) * a + enhanced_bgr.astype(np.float32) * (1.0 - a)
     result = np.clip(np.rint(blended), 0, 255).astype(np.uint8)
 
     core = strict_mask > 0
-    result[core] = original_bgr[core]
+    result[core] = graded[core]
     return result
 
 
-def verify_face_pixels(original_bgr, final_bgr, strict_mask):
-    """Stage 4 — confirm every strict-mask pixel is byte-identical to the original.
+def verify_face_grade(original_bgr, final_bgr, strict_mask, lut):
+    """Stage 4 — confirm faces are the original pixels under a pure tone mapping.
 
-    Returns (ok, changed_pixel_count).
+    Two independent checks:
+
+      1. Every strict-mask pixel must equal the original passed through the LUT,
+         byte for byte. Any AI-generated content — a redrawn eye, a smoothed
+         cheek, a sharpened edge — cannot survive this, because no global curve
+         can produce it from the original pixels.
+      2. Each channel curve must be non-decreasing. A monotonic mapping preserves
+         the ordering of tones, so it cannot invert or restructure detail; it can
+         only re-grade it.
+
+    Returns (ok, changed_pixel_count, monotonic).
     """
+    monotonic = all(bool(np.all(np.diff(lut[:, c].astype(np.int16)) >= 0)) for c in range(3))
+
     core = strict_mask > 0
     if not core.any():
-        return True, 0
+        return monotonic, 0, monotonic
 
-    diff = cv2.absdiff(original_bgr, final_bgr).max(axis=2)
+    expected = apply_tone_transfer(original_bgr, lut)
+    diff = cv2.absdiff(expected, final_bgr).max(axis=2)
     changed = int(np.count_nonzero((diff > 0) & core))
-    return changed == 0, changed
+    return (changed == 0 and monotonic), changed, monotonic
 
 
 def enhance_photo_pipeline(input_path: str, output_path: str) -> bool:
@@ -566,9 +634,12 @@ def enhance_photo_pipeline(input_path: str, output_path: str) -> bool:
         print(f"  Enhanced image saved: {os.path.basename(output_path)}")
         return True
 
-    # ---- Stage 3: strict composite ----
-    print(f"  Stage 3: compositing original face pixels...")
-    final = strict_composite(original, enhanced, strict_mask, alpha)
+    # ---- Stage 3: graded composite ----
+    # The tone curve is fitted only where alpha is 0 — the untouched enhanced
+    # region — so neither face pixels nor the feathered ring skew the fit.
+    print(f"  Stage 3: grading and compositing original face pixels...")
+    lut = compute_tone_transfer(original, enhanced, alpha == 0)
+    final = grade_and_composite(original, enhanced, strict_mask, alpha, lut)
 
     # ---- Stage 4: verification on a lossless PNG ----
     # JPEG would recompress the composite and invalidate a byte-exact check, so the
@@ -584,13 +655,17 @@ def enhance_photo_pipeline(input_path: str, output_path: str) -> bool:
             print(f"  ERROR: Could not read back verification PNG")
             return False
 
-        ok, changed = verify_face_pixels(original, reloaded, strict_mask)
+        ok, changed, monotonic = verify_face_grade(original, reloaded, strict_mask, lut)
         if not ok:
-            print(f"  WARNING: Verification FAILED — {changed} face pixel(s) changed. "
-                  f"Discarding enhanced result.")
+            if not monotonic:
+                print(f"  WARNING: Verification FAILED — tone curve is not monotonic, "
+                      f"so it could restructure facial detail. Discarding enhanced result.")
+            else:
+                print(f"  WARNING: Verification FAILED — {changed} face pixel(s) do not match "
+                      f"the graded original. Discarding enhanced result.")
             return False
 
-        print(f"  Stage 4: verified — 0 face pixels changed")
+        print(f"  Stage 4: verified — faces are the original pixels under a monotonic tone curve")
         cv2.imwrite(output_path, reloaded, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         print(f"  Enhanced image saved: {os.path.basename(output_path)}")
         return True
