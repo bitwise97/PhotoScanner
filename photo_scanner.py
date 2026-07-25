@@ -66,7 +66,7 @@ import requests
 import time
 import cv2
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, JpegImagePlugin
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -218,6 +218,111 @@ def is_black_and_white(image_path, saturation_threshold=10):
     avg_saturation = total_saturation / len(pixels)
     print(f"  Average saturation: {avg_saturation:.1f} (threshold: {saturation_threshold})")
     return avg_saturation < saturation_threshold
+
+# ============================================================
+# AUTO-ORIENTATION
+# ============================================================
+#
+# Scanners cannot tell which way up a print was placed on the glass: these scans do
+# carry EXIF, but the Orientation tag is always 1 ("upright"), so it is useless here.
+#
+# Face detection supplies the signal instead. Detectors are strongly orientation
+# sensitive, which is normally a nuisance and here is exactly what is wanted — on a
+# test scan the correct rotation found 3 faces while all three wrong rotations found
+# zero. Probing four rotations and taking the clear winner recovered the right answer
+# in 4 of 4 trials.
+#
+# Photos with no people give no signal at all and are deliberately left untouched:
+# wrongly rotating a correct photo is worse than leaving a sideways one to fix by hand.
+
+AUTO_ORIENT = True
+AUTO_ORIENT_DET_SIZE = 1024     # one scale is plenty to choose an orientation
+AUTO_ORIENT_MIN_SCORE = 0.5     # need at least one confident face before acting
+AUTO_ORIENT_MIN_MARGIN = 2.0    # winner must beat the runner-up by this factor
+
+# Rotation that must be APPLIED to make the image upright.
+_CV_ROTATIONS = {
+    0: None,
+    90: cv2.ROTATE_90_CLOCKWISE,
+    180: cv2.ROTATE_180,
+    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+}
+
+# PIL's transpose constants rotate counter-clockwise, so they are the mirror of the
+# OpenCV ones above for the same visual result.
+_PIL_ROTATIONS = {
+    90: Image.ROTATE_270,
+    180: Image.ROTATE_180,
+    270: Image.ROTATE_90,
+}
+
+
+def detect_orientation(image_bgr):
+    """Probe all four rotations and report which one makes the image upright.
+
+    Returns (degrees, scores). Degrees is 0 when the image already looks upright,
+    when no faces are found at any rotation, or when the result is too ambiguous
+    to act on.
+    """
+    scores = {}
+    for degrees, op in _CV_ROTATIONS.items():
+        probe = image_bgr if op is None else cv2.rotate(image_bgr, op)
+        faces = _get_face_analyzer(AUTO_ORIENT_DET_SIZE).get(probe)
+        scores[degrees] = (len(faces), float(sum(f.det_score for f in faces)))
+
+    ranked = sorted(scores.items(), key=lambda kv: kv[1][1], reverse=True)
+    best_degrees, (best_count, best_score) = ranked[0]
+    runner_score = ranked[1][1][1]
+
+    if best_count == 0 or best_score < AUTO_ORIENT_MIN_SCORE:
+        return 0, scores        # no faces anywhere — no signal to act on
+    if runner_score > 0 and best_score < AUTO_ORIENT_MIN_MARGIN * runner_score:
+        return 0, scores        # two orientations look plausible — leave it alone
+    return best_degrees, scores
+
+
+def auto_orient_file(path):
+    """Rotate a scan in place so its faces are upright. Returns degrees applied.
+
+    Everything downstream — black & white detection, the enhancement pipeline, and
+    the original uploaded to Drive — then works against the rotated file.
+    """
+    if not AUTO_ORIENT:
+        return 0
+
+    image = cv2.imread(path, cv2.IMREAD_COLOR)
+    if image is None:
+        return 0
+
+    degrees, scores = detect_orientation(image)
+    summary = "  ".join(f"{d}:{n}/{s:.1f}" for d, (n, s) in sorted(scores.items()))
+
+    if degrees == 0:
+        print(f"  Orientation: upright or undetermined [{summary}]")
+        return 0
+
+    # A 90/180/270 turn is lossless on the pixels themselves, but the file still has
+    # to be re-encoded because no lossless JPEG rotation tool (jpegtran) is available.
+    # Carrying the original quantization tables and chroma subsampling across keeps
+    # the generational loss of that re-encode negligible. They have to be passed
+    # explicitly rather than via quality='keep', because transpose() returns a fresh
+    # in-memory image that is no longer backed by the original JPEG.
+    with Image.open(path) as source:
+        qtables = getattr(source, 'quantization', None)
+        try:
+            subsampling = JpegImagePlugin.get_sampling(source)
+        except Exception:
+            subsampling = -1
+        rotated = source.transpose(_PIL_ROTATIONS[degrees])
+
+    if qtables:
+        rotated.save(path, 'JPEG', qtables=qtables, subsampling=subsampling)
+    else:
+        rotated.save(path, 'JPEG', quality=95)
+
+    print(f"  Orientation: rotated {degrees}° to upright [{summary}]")
+    return degrees
+
 
 # ============================================================
 # DUST REMOVAL (PRE-PROCESSING)
@@ -1230,6 +1335,11 @@ def main():
             if original_path != new_path:
                 os.rename(original_path, new_path)
                 print(f"  Renamed: {original_filename} -> {new_filename}")
+
+        # Straighten the scan in place before anything reads it, so black & white
+        # detection, the pipeline, and the original uploaded to Drive all work
+        # against the upright version.
+        auto_orient_file(new_path)
 
         ai_filename = new_filename.replace('.jpg', '_ai.jpg').replace('.JPG', '_ai.jpg')
 
