@@ -98,30 +98,37 @@ XAI_API_KEY = None
 # to discourage the model from repositioning or rescaling heads, since geometric
 # drift is what makes the Stage 3 composite misalign.
 #
-# The prompt's real job is color fidelity. Asking for "vivid, punchy" colors and
-# calling out clothing by name reliably produced invented colors (a gray shirt
-# coming back saturated blue), so the saturation instruction is deliberately
-# bounded to recovering what fading removed, and hue changes are forbidden outright.
-ENHANCEMENT_PROMPT = """Restore this scanned photograph. This is archival family history: the goal is faithful restoration, not creative reinterpretation.
+# The prompt's job is to restore aggressively. An earlier version tried to also
+# prevent invented colour — a gray shirt had come back saturated blue — by forbidding
+# hue changes and capping saturation. That worked, and cost far more than it saved:
+# "if you are unsure what color something originally was, leave it exactly as it is"
+# leaves large regions of a badly faded photo uncoloured, because on such a photo the
+# model is unsure about nearly everything. Measured against the old prompt on a
+# monochrome scan, floors, walls and doorways came back grey.
+#
+# Since the mask already protects faces mechanically, nothing here needs to be
+# cautious. The one targeted guard that remains is against repainting an object that
+# still carries obvious colour of its own, which is the actual blue-shirt failure —
+# without suppressing colour everywhere else to get it.
+ENHANCEMENT_PROMPT = """Restore this scanned photograph. This is archival family history from the mid-20th century, badly faded by age. Be decisive: a timid restoration of a photo this degraded is a failed one.
 
-WHAT TO FIX:
-- Remove the overall color cast (amber, yellow, blue, or magenta) left by film aging, as a single global white-balance correction applied evenly across the whole image.
-- Correct exposure and lift shadows so the scene reads as evenly and naturally lit.
-- Remove dust, specks, scratches, creases, and haze.
-- Restore the contrast and clarity that fading has cost the image.
+RESTORATION:
+- Neutralise the colour cast — usually amber, orange or magenta — that age has laid over the whole image.
+- Rebuild the colour that fading has drained away. Greens, blues, skin tones and fabrics should read as they would in a well-exposed photograph, not as pale ghosts of themselves.
+- Correct exposure, lift shadows, and recover blown highlights so the scene is evenly and naturally lit.
+- Remove dust, specks, scratches, creases and haze.
+- Restore the contrast, clarity and fine detail that fading has cost the image.
 
-COLOR FIDELITY — THIS IS THE PRIORITY:
-Every object must keep its original color identity. Correct the cast; do not repaint the subject.
-- Do not change the hue of anything. A gray shirt stays gray. A brown floor stays brown. A white wall stays white.
-- Neutral objects stay neutral. Never add color to something that is gray, white, or black.
-- Recover saturation only to the degree that fading removed it. Do not exceed the saturation an ordinary, well-exposed photograph of this scene would have had.
-- Do not make colors vivid, punchy, bold, or rich. Natural and accurate is correct; striking is wrong.
-- If you are unsure what color something originally was, leave it exactly as it is.
+COLOUR:
+- Every part of the photograph should end up properly coloured. Do not leave a region grey or washed out because the original is ambiguous — infer the most plausible colour for it and commit to that.
+- Keep colour believable for the period and the scene: full and natural, not neon.
+- Where an object still carries obvious colour of its own, keep that colour rather than repainting it as something else.
 
 GEOMETRY:
 - Keep the exact framing, aspect ratio, and placement. Do not crop, rotate, zoom, or reposition anything.
 - Keep every person and object at its original position, scale, and pose. Heads in particular must not move or change size.
-- Do not add, remove, or substitute any object, person, or background element.
+- Do not add, remove, or substitute any person, or invent objects that were not part of the scene.
+- Damage is not part of the scene. Where the print is torn, creased, stained, faded out, or distorted, reconstruct what was plausibly behind the damage — a continuing wall, floor, or sky — rather than preserving the damage or rendering it as some other object.
 
 TEXT:
 - Preserve any physically printed date or text exactly. Add no text, borders, or watermarks.
@@ -136,14 +143,15 @@ Output only the restored photograph."""
 # gray, white, or black"), which is exactly what stopped B&W scans from being
 # colorized; this one asks for it directly rather than relying on a vibrance
 # instruction to produce it as a side effect, which is how it used to happen.
-COLORIZE_PROMPT = """Restore and colorize this black and white scanned photograph. This is archival family history from the 1940s and 1950s: the goal is a believable period photograph, not a modern or stylised one.
+COLORIZE_PROMPT = """Colorize and restore this black and white scanned photograph. This is archival family history from the 1940s and 1950s. Colour the whole photograph confidently: a partly-coloured result is worse than no colour at all.
 
 COLORIZATION:
-- Add natural, believable colour throughout. The result should look like colour film of the period, not a modern digital photograph.
-- Give skin natural, healthy tones appropriate to each person. Avoid orange, waxy, or plastic-looking skin.
-- Keep the palette restrained and slightly muted, as mid-century colour film would render it. Do not produce vivid, saturated, or neon colour.
-- Choose plausible, ordinary colours for clothing, walls, cars, and foliage. Where the original tone gives no clue, prefer muted and conventional choices over striking ones.
-- Anything that was genuinely white, black, or grey in the scene — white shirts, black suits, grey stone — must stay that way. Do not tint neutral objects.
+- Add full, believable colour to every part of the image — people, clothing, furniture, walls, floors, foliage, sky, and every background detail. No region should be left grey.
+- The source is monochrome, so nothing in it can tell you what was "already" coloured. Where you cannot tell, infer the most plausible colour for that object and commit to it rather than leaving it neutral.
+- Give skin warm, natural, healthy tones suited to each person. Avoid orange, waxy, or plastic-looking skin.
+- Choose ordinary, believable colours: wood floors warm brown, foliage green, denim blue, brick red.
+- Aim for the look of well-exposed mid-century colour film — full and warm, neither pale nor neon.
+- Something clearly meant to read as white or black — a white dress shirt, a black suit — may stay near neutral, but everything else must carry colour.
 
 RESTORATION:
 - Correct exposure and lift shadows so the scene reads as evenly and naturally lit.
@@ -153,7 +161,8 @@ RESTORATION:
 GEOMETRY:
 - Keep the exact framing, aspect ratio, and placement. Do not crop, rotate, zoom, or reposition anything.
 - Keep every person and object at its original position, scale, and pose. Heads in particular must not move or change size.
-- Do not add, remove, or substitute any object, person, or background element.
+- Do not add, remove, or substitute any person, or invent objects that were not part of the scene.
+- Damage is not part of the scene. Where the print is torn, creased, stained, faded out, or distorted, reconstruct what was plausibly behind the damage — a continuing wall, floor, or sky — rather than preserving the damage or rendering it as some other object.
 
 TEXT:
 - Preserve any physically printed date or text exactly. Add no text, borders, or watermarks.
@@ -574,6 +583,20 @@ FACE_MODULES = ['detection', 'landmark_2d_106']
 FACE_CHROMA_SMOOTH_PX = 3
 FACE_LUMA_TOLERANCE = 0
 
+# How much of xAI's luminance is mixed into faces. 0.0 preserves the scan's facial
+# detail exactly; 1.0 hands faces over to xAI entirely.
+#
+# Strict preservation turned out to be visibly worse than it sounds. On real scans
+# the untouched face pixels carry halftone mesh and softness that the surrounding
+# photograph no longer has once xAI has reconstructed it, so a masked face reads as
+# damaged next to the same person's unmasked hands. A modest share of xAI luminance
+# lifts that without handing over facial identity: at 0.30 roughly seven tenths of
+# every feature is still the scan.
+#
+# Face chroma always comes wholly from xAI regardless of this weight, which is what
+# keeps a face the same colour as its own surroundings.
+FACE_XAI_LUMA_BLEND = 0.30
+
 # Faces are deliberately excluded from median despeckling (set below 3 = off).
 #
 # Including them was tried, on the theory that the halftone mesh is an artifact of
@@ -774,41 +797,6 @@ def enhance_via_xai_array(image_bgr, work_path, prompt=None):
                 os.remove(temp)
 
 
-def compute_tone_transfer(original_bgr, enhanced_bgr, fit_mask):
-    """Derive the global per-channel tone curve the enhancement applied.
-
-    Fitted by histogram matching over `fit_mask` — the non-face region — so it
-    describes the grade xAI applied to the rest of the photograph. Because the fit
-    uses tonal distributions rather than pixel correspondence, it is unaffected by
-    the geometric drift a generative model introduces.
-
-    Returns a (256, 3) uint8 LUT, one monotonic curve per BGR channel.
-    """
-    lut = np.zeros((256, 3), dtype=np.uint8)
-    levels = np.arange(256)
-
-    for c in range(3):
-        src_cdf = np.cumsum(np.bincount(original_bgr[..., c][fit_mask], minlength=256).astype(np.float64))
-        dst_cdf = np.cumsum(np.bincount(enhanced_bgr[..., c][fit_mask], minlength=256).astype(np.float64))
-        if src_cdf[-1] == 0 or dst_cdf[-1] == 0:
-            lut[:, c] = levels  # nothing to fit; identity
-            continue
-        src_cdf /= src_cdf[-1]
-        dst_cdf /= dst_cdf[-1]
-        # For each source level, the enhanced level sitting at the same quantile.
-        lut[:, c] = np.clip(np.rint(np.interp(src_cdf, dst_cdf, levels)), 0, 255).astype(np.uint8)
-
-    return lut
-
-
-def apply_tone_transfer(image_bgr, lut):
-    """Map an image through a (256, 3) per-channel LUT."""
-    out = np.empty_like(image_bgr)
-    for c in range(3):
-        out[..., c] = lut[:, c][image_bgr[..., c]]
-    return out
-
-
 def _radius_map(shape):
     """Distance of every spectrum cell from the (fftshifted) DC centre."""
     h, w = shape
@@ -952,19 +940,6 @@ def smooth_face_chroma(image_bgr, radius=FACE_CHROMA_SMOOTH_PX):
     return result
 
 
-def build_face_layer(face_source_bgr, lut):
-    """The deterministic face transform applied at working resolution: tone-grade,
-    then smooth chroma. Takes the output of prepare_face_source().
-
-    Kept in one function so Stage 4 can recompute it independently and compare the
-    result byte-for-byte against what actually got written. No step here can
-    introduce content that was not already in the scan: a band-stop filter and a
-    monotonic curve are both subtractive, and chroma smoothing leaves luminance
-    untouched.
-    """
-    return smooth_face_chroma(apply_tone_transfer(face_source_bgr, lut))
-
-
 def prepare_face_source(original_bgr, boxes, work_size):
     """Build the image every face pixel ultimately comes from.
 
@@ -984,30 +959,6 @@ def prepare_face_source(original_bgr, boxes, work_size):
     if (source.shape[1], source.shape[0]) != tuple(work_size):
         source = cv2.resize(source, tuple(work_size), interpolation=cv2.INTER_AREA)
     return source, detail_loss
-
-
-def grade_and_composite(face_source_bgr, enhanced_bgr, strict_mask, alpha, lut):
-    """Stage 3 — composite tone-graded ORIGINAL face pixels onto the enhanced image.
-
-    Face pixels come from the original scan, mapped through the global curve derived
-    from the rest of the photo. Nothing is regenerated: the mapping is per-pixel and
-    per-channel, so grain, texture, expressions, and every spatial relationship in
-    the face survive intact — only color and tone move, bringing faces into register
-    with the corrected background instead of leaving them as raw amber patches.
-
-    The alpha ramp smooths the ring outside the strict mask; the strict area is then
-    overwritten with the graded original so no blending or rounding can mix in
-    enhanced-image content.
-    """
-    graded = build_face_layer(face_source_bgr, lut)
-
-    a = alpha[..., None]
-    blended = graded.astype(np.float32) * a + enhanced_bgr.astype(np.float32) * (1.0 - a)
-    result = np.clip(np.rint(blended), 0, 255).astype(np.uint8)
-
-    core = strict_mask > 0
-    result[core] = graded[core]
-    return result
 
 
 def _merge_luma_chroma(luma, chroma_ycrcb, max_passes=6):
@@ -1044,19 +995,38 @@ def _merge_luma_chroma(luma, chroma_ycrcb, max_passes=6):
     return cv2.cvtColor(merged, cv2.COLOR_YCrCb2BGR)
 
 
-def colorize_and_composite(face_source_bgr, enhanced_bgr, strict_mask, alpha):
-    """Stage 3 for black & white scans: the scan's facial detail, xAI's colour.
+def build_face_layer(face_source_bgr, enhanced_bgr, weight=FACE_XAI_LUMA_BLEND):
+    """The face layer: luminance mostly from the scan, chroma entirely from xAI.
 
-    Colorizing a face necessarily changes its pixels, so the byte-exact guarantee
-    used for colour photos cannot apply. The split preserves what actually matters
-    instead: luminance carries essentially all perceived detail, so taking it
-    entirely from the scan means no line, wrinkle, or expression can be invented —
-    xAI supplies only the tint. Stage 4 verifies that split held.
+    Splitting the channels separates the two things that were going wrong. Chroma
+    taken wholesale from xAI means a face always matches the colour of its own
+    surroundings; the earlier approach tinted faces with a curve fitted from the
+    whole scene, which on a sepia photo produced a mauve cast that was the scene
+    average rather than skin.
+
+    Luminance is where facial identity lives, so it stays weighted toward the scan.
+    A modest share of xAI's luminance is mixed in to lift the halftone mesh and
+    softness that faithful preservation would otherwise carry into an otherwise
+    clean photograph. At the default weight roughly seven tenths of every facial
+    feature is still the original scan.
+
+    Deterministic, so Stage 4 can recompute it and compare byte for byte.
     """
-    face_layer = _merge_luma_chroma(
-        cv2.cvtColor(face_source_bgr, cv2.COLOR_BGR2YCrCb)[..., 0],
-        cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2YCrCb))
+    src = cv2.cvtColor(face_source_bgr, cv2.COLOR_BGR2YCrCb)
+    enh = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2YCrCb)
 
+    luma = np.clip(np.rint((1.0 - weight) * src[..., 0].astype(np.float32)
+                           + weight * enh[..., 0].astype(np.float32)),
+                   0, 255).astype(np.uint8)
+    return _merge_luma_chroma(luma, enh)
+
+
+def composite_faces(face_layer, enhanced_bgr, strict_mask, alpha):
+    """Stage 3 — lay the face layer over xAI's result.
+
+    The alpha ramp smooths the ring outside the strict mask; the strict area is then
+    overwritten outright so no blending or rounding can mix in anything else.
+    """
     a = alpha[..., None]
     blended = face_layer.astype(np.float32) * a + enhanced_bgr.astype(np.float32) * (1.0 - a)
     result = np.clip(np.rint(blended), 0, 255).astype(np.uint8)
@@ -1066,66 +1036,28 @@ def colorize_and_composite(face_source_bgr, enhanced_bgr, strict_mask, alpha):
     return result
 
 
-def verify_face_colorization(face_source_bgr, final_bgr, strict_mask):
-    """Stage 4 for colorized scans — faces must carry the scan's luminance exactly.
+def verify_face_blend(face_source_bgr, enhanced_bgr, final_bgr, strict_mask,
+                      detail_loss, weight=FACE_XAI_LUMA_BLEND):
+    """Stage 4 — confirm faces are exactly the defined blend and nothing else.
 
-    Colour is allowed to differ, since that is the point. Luminance is not: any
-    AI-invented facial structure would show up as a luminance difference, because
-    structure cannot be expressed in chroma alone.
+    Recomputing the face layer independently and comparing byte for byte pins the
+    whole transform down: the only inputs are the scan and xAI's output, combined at
+    a fixed, known weight. A different weight, a stray filter, or content from
+    anywhere else all fail this.
 
-    Returns (ok, changed_pixel_count).
+    The descreen guard still applies, since descreening runs before the blend.
+
+    Returns (ok, changed_pixel_count, detail_loss).
     """
     core = strict_mask > 0
     if not core.any():
-        return True, 0
+        return detail_loss <= FACE_MAX_DETAIL_LOSS, 0, detail_loss
 
-    source_luma = cv2.cvtColor(face_source_bgr, cv2.COLOR_BGR2YCrCb)[..., 0].astype(np.int16)
-    final_luma = cv2.cvtColor(final_bgr, cv2.COLOR_BGR2YCrCb)[..., 0].astype(np.int16)
-    changed = int(np.count_nonzero((np.abs(source_luma - final_luma) > 0) & core))
-    return changed == 0, changed
-
-
-def verify_face_grade(face_source_bgr, final_bgr, strict_mask, lut, detail_loss):
-    """Stage 4 — confirm faces are the original pixels under a tone curve and a
-    chroma-only smooth, and nothing else.
-
-    Three independent checks:
-
-      1. Every strict-mask pixel must equal the independently recomputed face
-         layer, byte for byte. Any AI-generated content — a redrawn eye, a
-         smoothed cheek, a sharpened edge — fails here, because the face layer is
-         derived solely from the original scan.
-      2. Each channel curve must be non-decreasing. A monotonic mapping preserves
-         the ordering of tones, so it cannot invert or restructure detail.
-      3. The chroma smoothing must leave luminance intact, which is what proves it
-         touched only color and not detail.
-      4. Descreening must not have cost more than FACE_MAX_DETAIL_LOSS of the
-         15-55px band, where real facial structure lives. This is the guard for a
-         photo whose screen frequency sits close to genuine detail — it fails
-         loudly rather than quietly softening a face.
-
-    Returns (ok, changed_pixel_count, monotonic, max_luma_deviation, detail_loss).
-    """
-    monotonic = all(bool(np.all(np.diff(lut[:, c].astype(np.int16)) >= 0)) for c in range(3))
-
-    core = strict_mask > 0
-    if not core.any():
-        return monotonic, 0, monotonic, 0, detail_loss
-
-    graded = apply_tone_transfer(face_source_bgr, lut)
-    expected = smooth_face_chroma(graded)
-
-    # Did smoothing disturb luminance anywhere in the face?
-    luma_before = cv2.cvtColor(graded, cv2.COLOR_BGR2YCrCb)[..., 0].astype(np.int16)
-    luma_after = cv2.cvtColor(expected, cv2.COLOR_BGR2YCrCb)[..., 0].astype(np.int16)
-    luma_dev = int(np.abs(luma_before - luma_after)[core].max())
-
+    expected = build_face_layer(face_source_bgr, enhanced_bgr, weight)
     diff = cv2.absdiff(expected, final_bgr).max(axis=2)
     changed = int(np.count_nonzero((diff > 0) & core))
 
-    ok = (changed == 0 and monotonic and luma_dev <= FACE_LUMA_TOLERANCE
-          and detail_loss <= FACE_MAX_DETAIL_LOSS)
-    return ok, changed, monotonic, luma_dev, detail_loss
+    return (changed == 0 and detail_loss <= FACE_MAX_DETAIL_LOSS), changed, detail_loss
 
 
 def enhance_photo_pipeline(input_path: str, output_path: str, colorize: bool = False) -> bool:
@@ -1207,15 +1139,13 @@ def enhance_photo_pipeline(input_path: str, output_path: str, colorize: bool = F
     # ---- Stage 3: graded composite ----
     # The tone curve is fitted only where alpha is 0 — the untouched enhanced
     # region — so neither face pixels nor the feathered ring skew the fit.
-    if colorize:
-        # Monochrome scan: keep the scan's facial detail, take only colour from xAI.
-        print(f"  Stage 3: compositing original face detail with colorized tone...")
-        lut = None
-        final = colorize_and_composite(face_source, enhanced, strict_work, alpha_work)
-    else:
-        print(f"  Stage 3: grading and compositing original face pixels...")
-        lut = compute_tone_transfer(face_source, enhanced, alpha_work == 0)
-        final = grade_and_composite(face_source, enhanced, strict_work, alpha_work, lut)
+    # Colour and monochrome scans now take the same path: face chroma comes wholly
+    # from xAI so it matches its surroundings, while luminance stays weighted toward
+    # the scan so facial identity is not handed over.
+    print(f"  Stage 3: compositing faces ({100 * (1 - FACE_XAI_LUMA_BLEND):.0f}% scan "
+          f"luminance, xAI colour)...")
+    face_layer = build_face_layer(face_source, enhanced)
+    final = composite_faces(face_layer, enhanced, strict_work, alpha_work)
 
     # ---- Stage 4: verification on a lossless PNG ----
     # JPEG would recompress the composite and invalidate a byte-exact check, so the
@@ -1231,37 +1161,20 @@ def enhance_photo_pipeline(input_path: str, output_path: str, colorize: bool = F
             print(f"  ERROR: Could not read back verification PNG")
             return False
 
-        if colorize:
-            ok, changed = verify_face_colorization(face_source, reloaded, strict_work)
-            if not ok:
-                print(f"  WARNING: Verification FAILED — {changed} face pixel(s) do not carry "
-                      f"the scan's luminance. Discarding enhanced result.")
-                return False
-            print(f"  Stage 4: verified — faces carry the scan's luminance exactly; "
-                  f"only colour came from xAI")
-            cv2.imwrite(output_path, reloaded, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-            print(f"  Enhanced image saved: {os.path.basename(output_path)}")
-            return True
-
-        ok, changed, monotonic, luma_dev, detail_loss = verify_face_grade(
-            face_source, reloaded, strict_work, lut, detail_loss)
+        ok, changed, detail_loss = verify_face_blend(
+            face_source, enhanced, reloaded, strict_work, detail_loss)
         if not ok:
-            if not monotonic:
-                print(f"  WARNING: Verification FAILED — tone curve is not monotonic, "
-                      f"so it could restructure facial detail. Discarding enhanced result.")
-            elif luma_dev > FACE_LUMA_TOLERANCE:
-                print(f"  WARNING: Verification FAILED — chroma smoothing shifted face "
-                      f"luminance by up to {luma_dev} levels. Discarding enhanced result.")
-            elif detail_loss > FACE_MAX_DETAIL_LOSS:
+            if detail_loss > FACE_MAX_DETAIL_LOSS:
                 print(f"  WARNING: Verification FAILED — descreening cost {detail_loss:.1%} of "
                       f"facial detail (limit {FACE_MAX_DETAIL_LOSS:.0%}). Discarding enhanced result.")
             else:
                 print(f"  WARNING: Verification FAILED — {changed} face pixel(s) do not match "
-                      f"the graded original. Discarding enhanced result.")
+                      f"the recomputed blend. Discarding enhanced result.")
             return False
 
-        print(f"  Stage 4: verified — faces are the original pixels under a monotonic tone "
-              f"curve; luminance shift {luma_dev}, descreen detail loss {detail_loss:.1%}")
+        print(f"  Stage 4: verified — faces are exactly "
+              f"{100 * (1 - FACE_XAI_LUMA_BLEND):.0f}% scan luminance + xAI colour; "
+              f"descreen detail loss {detail_loss:.1%}")
         cv2.imwrite(output_path, reloaded, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         print(f"  Enhanced image saved: {os.path.basename(output_path)}")
         return True
