@@ -128,6 +128,38 @@ TEXT:
 
 Output only the restored photograph."""
 
+# Prompt for scans detected as black & white.
+#
+# Adding colour to a neutral object is a single behaviour that is wrong on a colour
+# photo and wanted on a monochrome one, so the two cases cannot share a prompt. The
+# colour prompt above forbids it outright ("Never add color to something that is
+# gray, white, or black"), which is exactly what stopped B&W scans from being
+# colorized; this one asks for it directly rather than relying on a vibrance
+# instruction to produce it as a side effect, which is how it used to happen.
+COLORIZE_PROMPT = """Restore and colorize this black and white scanned photograph. This is archival family history from the 1940s and 1950s: the goal is a believable period photograph, not a modern or stylised one.
+
+COLORIZATION:
+- Add natural, believable colour throughout. The result should look like colour film of the period, not a modern digital photograph.
+- Give skin natural, healthy tones appropriate to each person. Avoid orange, waxy, or plastic-looking skin.
+- Keep the palette restrained and slightly muted, as mid-century colour film would render it. Do not produce vivid, saturated, or neon colour.
+- Choose plausible, ordinary colours for clothing, walls, cars, and foliage. Where the original tone gives no clue, prefer muted and conventional choices over striking ones.
+- Anything that was genuinely white, black, or grey in the scene — white shirts, black suits, grey stone — must stay that way. Do not tint neutral objects.
+
+RESTORATION:
+- Correct exposure and lift shadows so the scene reads as evenly and naturally lit.
+- Remove dust, specks, scratches, creases, and haze.
+- Restore the contrast and clarity that fading has cost the image.
+
+GEOMETRY:
+- Keep the exact framing, aspect ratio, and placement. Do not crop, rotate, zoom, or reposition anything.
+- Keep every person and object at its original position, scale, and pose. Heads in particular must not move or change size.
+- Do not add, remove, or substitute any object, person, or background element.
+
+TEXT:
+- Preserve any physically printed date or text exactly. Add no text, borders, or watermarks.
+
+Output only the restored photograph."""
+
 # Topaz enhancement prompt (max 1024 characters — condensed version of the xAI prompt)
 TOPAZ_PROMPT = ("Restore this old scanned photograph. "
                 "Remove scratches, dust, creases, and haze. "
@@ -407,8 +439,12 @@ def apply_dust_removal(input_path, output_path):
 # XAI ENHANCEMENT FUNCTION
 # ============================================================
 
-def enhance_with_xai(input_path, output_path):
-    """Send a photo to xAI for enhancement and save the result."""
+def enhance_with_xai(input_path, output_path, prompt=None):
+    """Send a photo to xAI for enhancement and save the result.
+
+    `prompt` selects the instruction set: ENHANCEMENT_PROMPT preserves the colours
+    already in the scan, COLORIZE_PROMPT adds colour to a monochrome one.
+    """
     print(f"  Sending to xAI for enhancement...")
 
     with open(input_path, 'rb') as f:
@@ -422,7 +458,7 @@ def enhance_with_xai(input_path, output_path):
         },
         json={
             'model': 'grok-imagine-image',
-            'prompt': ENHANCEMENT_PROMPT,
+            'prompt': prompt or ENHANCEMENT_PROMPT,
             'image': {
                 'url': f'data:image/jpeg;base64,{image_data}'
             }
@@ -708,7 +744,7 @@ def apply_masked_dust_removal(image_bgr, strict_mask):
     return filtered
 
 
-def enhance_via_xai_array(image_bgr, work_path):
+def enhance_via_xai_array(image_bgr, work_path, prompt=None):
     """Stage 2 — round-trip an image array through xAI and return the enhanced array.
 
     The result is returned at whatever resolution xAI produced, which is typically
@@ -723,7 +759,7 @@ def enhance_via_xai_array(image_bgr, work_path):
 
     try:
         cv2.imwrite(stage_in, image_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-        if not enhance_with_xai(stage_in, stage_out):
+        if not enhance_with_xai(stage_in, stage_out, prompt):
             return None
 
         enhanced = cv2.imread(stage_out, cv2.IMREAD_COLOR)
@@ -974,6 +1010,81 @@ def grade_and_composite(face_source_bgr, enhanced_bgr, strict_mask, alpha, lut):
     return result
 
 
+def _merge_luma_chroma(luma, chroma_ycrcb, max_passes=6):
+    """Combine a luminance plane with someone else's chroma, preserving luminance.
+
+    Pairing the scan's luminance with the colorized image's chroma can land outside
+    the RGB cube; the conversion clips, and clipping moves luminance — the same trap
+    that broke chroma smoothing. Offending pixels have their chroma pulled toward
+    neutral until they fit, and anything still failing is left neutral, which is
+    always in gamut. Luminance therefore comes out exact rather than approximate.
+    """
+    cr = chroma_ycrcb[..., 1].astype(np.float32)
+    cb = chroma_ycrcb[..., 2].astype(np.float32)
+    scale = np.ones(luma.shape, dtype=np.float32)
+
+    for _ in range(max_passes):
+        merged = np.stack([
+            luma,
+            np.clip(128.0 + (cr - 128.0) * scale, 0, 255).astype(np.uint8),
+            np.clip(128.0 + (cb - 128.0) * scale, 0, 255).astype(np.uint8),
+        ], axis=-1)
+        bgr = cv2.cvtColor(merged, cv2.COLOR_YCrCb2BGR)
+        drifted = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)[..., 0] != luma
+        if not drifted.any():
+            return bgr
+        scale[drifted] *= 0.5
+
+    scale[drifted] = 0.0        # neutral chroma: always in gamut
+    merged = np.stack([
+        luma,
+        np.clip(128.0 + (cr - 128.0) * scale, 0, 255).astype(np.uint8),
+        np.clip(128.0 + (cb - 128.0) * scale, 0, 255).astype(np.uint8),
+    ], axis=-1)
+    return cv2.cvtColor(merged, cv2.COLOR_YCrCb2BGR)
+
+
+def colorize_and_composite(face_source_bgr, enhanced_bgr, strict_mask, alpha):
+    """Stage 3 for black & white scans: the scan's facial detail, xAI's colour.
+
+    Colorizing a face necessarily changes its pixels, so the byte-exact guarantee
+    used for colour photos cannot apply. The split preserves what actually matters
+    instead: luminance carries essentially all perceived detail, so taking it
+    entirely from the scan means no line, wrinkle, or expression can be invented —
+    xAI supplies only the tint. Stage 4 verifies that split held.
+    """
+    face_layer = _merge_luma_chroma(
+        cv2.cvtColor(face_source_bgr, cv2.COLOR_BGR2YCrCb)[..., 0],
+        cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2YCrCb))
+
+    a = alpha[..., None]
+    blended = face_layer.astype(np.float32) * a + enhanced_bgr.astype(np.float32) * (1.0 - a)
+    result = np.clip(np.rint(blended), 0, 255).astype(np.uint8)
+
+    core = strict_mask > 0
+    result[core] = face_layer[core]
+    return result
+
+
+def verify_face_colorization(face_source_bgr, final_bgr, strict_mask):
+    """Stage 4 for colorized scans — faces must carry the scan's luminance exactly.
+
+    Colour is allowed to differ, since that is the point. Luminance is not: any
+    AI-invented facial structure would show up as a luminance difference, because
+    structure cannot be expressed in chroma alone.
+
+    Returns (ok, changed_pixel_count).
+    """
+    core = strict_mask > 0
+    if not core.any():
+        return True, 0
+
+    source_luma = cv2.cvtColor(face_source_bgr, cv2.COLOR_BGR2YCrCb)[..., 0].astype(np.int16)
+    final_luma = cv2.cvtColor(final_bgr, cv2.COLOR_BGR2YCrCb)[..., 0].astype(np.int16)
+    changed = int(np.count_nonzero((np.abs(source_luma - final_luma) > 0) & core))
+    return changed == 0, changed
+
+
 def verify_face_grade(face_source_bgr, final_bgr, strict_mask, lut, detail_loss):
     """Stage 4 — confirm faces are the original pixels under a tone curve and a
     chroma-only smooth, and nothing else.
@@ -1017,7 +1128,7 @@ def verify_face_grade(face_source_bgr, final_bgr, strict_mask, lut, detail_loss)
     return ok, changed, monotonic, luma_dev, detail_loss
 
 
-def enhance_photo_pipeline(input_path: str, output_path: str) -> bool:
+def enhance_photo_pipeline(input_path: str, output_path: str, colorize: bool = False) -> bool:
     """Enhance a photo while guaranteeing human faces are unchanged at the pixel level.
 
     Faces are detected and descreened at the scan's full resolution, then everything
@@ -1054,9 +1165,12 @@ def enhance_photo_pipeline(input_path: str, output_path: str) -> bool:
 
     # ---- Stage 2: enhancement ----
     # Faces are excluded from dust removal so their guarantee holds against the raw scan.
-    print(f"  Stage 2: dust removal (outside faces) + xAI enhancement...")
+    mode = 'colorize' if colorize else 'enhance'
+    print(f"  Stage 2: dust removal (outside faces) + xAI {mode}...")
     prepared = apply_masked_dust_removal(original, strict_mask)
-    enhanced = enhance_via_xai_array(prepared, os.path.splitext(output_path)[0])
+    enhanced = enhance_via_xai_array(
+        prepared, os.path.splitext(output_path)[0],
+        COLORIZE_PROMPT if colorize else ENHANCEMENT_PROMPT)
     if enhanced is None:
         print(f"  ERROR: Stage 2 enhancement failed")
         return False
@@ -1093,9 +1207,15 @@ def enhance_photo_pipeline(input_path: str, output_path: str) -> bool:
     # ---- Stage 3: graded composite ----
     # The tone curve is fitted only where alpha is 0 — the untouched enhanced
     # region — so neither face pixels nor the feathered ring skew the fit.
-    print(f"  Stage 3: grading and compositing original face pixels...")
-    lut = compute_tone_transfer(face_source, enhanced, alpha_work == 0)
-    final = grade_and_composite(face_source, enhanced, strict_work, alpha_work, lut)
+    if colorize:
+        # Monochrome scan: keep the scan's facial detail, take only colour from xAI.
+        print(f"  Stage 3: compositing original face detail with colorized tone...")
+        lut = None
+        final = colorize_and_composite(face_source, enhanced, strict_work, alpha_work)
+    else:
+        print(f"  Stage 3: grading and compositing original face pixels...")
+        lut = compute_tone_transfer(face_source, enhanced, alpha_work == 0)
+        final = grade_and_composite(face_source, enhanced, strict_work, alpha_work, lut)
 
     # ---- Stage 4: verification on a lossless PNG ----
     # JPEG would recompress the composite and invalidate a byte-exact check, so the
@@ -1110,6 +1230,18 @@ def enhance_photo_pipeline(input_path: str, output_path: str) -> bool:
         if reloaded is None:
             print(f"  ERROR: Could not read back verification PNG")
             return False
+
+        if colorize:
+            ok, changed = verify_face_colorization(face_source, reloaded, strict_work)
+            if not ok:
+                print(f"  WARNING: Verification FAILED — {changed} face pixel(s) do not carry "
+                      f"the scan's luminance. Discarding enhanced result.")
+                return False
+            print(f"  Stage 4: verified — faces carry the scan's luminance exactly; "
+                  f"only colour came from xAI")
+            cv2.imwrite(output_path, reloaded, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            print(f"  Enhanced image saved: {os.path.basename(output_path)}")
+            return True
 
         ok, changed, monotonic, luma_dev, detail_loss = verify_face_grade(
             face_source, reloaded, strict_work, lut, detail_loss)
@@ -1430,7 +1562,7 @@ def main():
                 os.remove(dust_removed_path)
         else:
             # 4-stage pipeline; it applies its own face-masked dust removal internally.
-            success = enhance_photo_pipeline(new_path, ai_path)
+            success = enhance_photo_pipeline(new_path, ai_path, colorize=is_bw)
 
         if success:
             # Upload both the original and enhanced version to Drive
