@@ -4,22 +4,34 @@
 # Automatically detects black & white photos and produces a grayscale-enhanced
 # version alongside the color-enhanced version, using the Pillow image library.
 #
-# Enhancement pipeline (default, xAI): a 4-stage face-preserving pipeline guarantees
-# human faces are unchanged at the pixel level rather than relying on prompt wording.
+# How a photo is processed is chosen by its filename prefix. Rename a scan and drop
+# it back in ~/Pictures to re-run it a different way; every route writes the same
+# output name, so IMG_20260702_0015_ai.jpg either way:
+#
+#   IMG_20260702_0015.jpg           xAI, unrestricted (default)
+#   preserve_IMG_20260702_0015.jpg  xAI, with the face-preserving pipeline
+#   topaz_IMG_20260702_0015.jpg     Topaz instead of xAI
+#
+# Unrestricted xAI is the default because it produces the best results on most
+# photos — it reconstructs detail and repairs damage freely. On some photos it
+# cannot resist reworking faces until people are no longer recognisable, and the
+# 'preserve_' prefix is the remedy for those:
+#
 #   Stage 1  InsightFace detects every face and builds a pixel-precise mask.
 #   Stage 2  Dust removal runs outside the mask only, then xAI enhances the image.
-#   Stage 3  The original face pixels are composited back over the result, graded
-#            through the same global tone curve the enhancement applied elsewhere,
-#            with a soft transition ring just outside the strict face area.
-#   Stage 4  The composite is verified byte-for-byte as a lossless PNG; the PNG is
-#            then converted to the final JPEG and discarded.
-# If verification fails, the photo is treated as a failure: nothing is uploaded and
-# the local file is kept so it can be retried or routed through Topaz.
+#   Stage 3  Faces are rebuilt from the scan and composited back: chroma entirely
+#            from xAI so a face matches its surroundings, luminance weighted toward
+#            the scan so facial identity stays original. A soft transition ring sits
+#            just outside the strict face area.
+#   Stage 4  The composite is verified byte-for-byte as a lossless PNG, proving the
+#            face is exactly that blend and nothing else; the PNG is then converted
+#            to the final JPEG and discarded.
 #
-# Topaz fallback: To route a specific file through Topaz instead of xAI, prefix the
-# filename with 'topaz_' before dropping it in ~/Pictures, e.g.:
-#   topaz_IMG_20260702_0015.jpg  →  processed by Topaz  →  IMG_20260702_0015_ai.jpg
-# The Topaz path uses whole-image dust removal and is not face-masked.
+# If verification fails, the photo is treated as a failure: nothing is uploaded and
+# the local file is kept so it can be retried or routed a different way.
+#
+# Both the default and Topaz routes use whole-image dust removal and are not
+# face-masked. Auto-orientation and black & white detection apply to every route.
 #
 # Usage:
 #   python photo_scanner.py [--folder-id <DRIVE_FOLDER_ID>]
@@ -1285,6 +1297,42 @@ def enhance_with_topaz(input_path, output_path):
     return True
 
 # ============================================================
+# PROCESSING MODE (SELECTED BY FILENAME PREFIX)
+# ============================================================
+#
+# Letting xAI enhance freely gives the best results on most photos. On some it
+# cannot resist reworking faces until people stop being recognisable, and that is
+# what the masked pipeline exists to fix — so it is opt-in per photo rather than
+# applied to everything. Rename a scan and drop it back in ~/Pictures to re-run it
+# a different way:
+#
+#   IMG_20260702_0015.jpg           xAI, unrestricted (default)
+#   preserve_IMG_20260702_0015.jpg  xAI, with the face-preserving pipeline
+#   topaz_IMG_20260702_0015.jpg     Topaz instead of xAI
+#
+# Every route writes the same output name, IMG_20260702_0015_ai.jpg.
+
+MODE_PREFIXES = {
+    'topaz_': 'topaz',
+    'preserve_': 'preserve',
+}
+
+
+def split_mode_prefix(filename):
+    """Split a scanner filename into (mode, base_filename).
+
+    Mode is 'xai' when no prefix is present. Centralised because the prefix has to
+    be stripped in several places — sequence parsing, date extraction, renaming —
+    and hardcoding the lengths in each of them invites them to drift apart.
+    """
+    lowered = filename.lower()
+    for prefix, mode in MODE_PREFIXES.items():
+        if lowered.startswith(prefix):
+            return mode, filename[len(prefix):]
+    return 'xai', filename
+
+
+# ============================================================
 # CONFIG HANDLING
 # ============================================================
 
@@ -1354,6 +1402,8 @@ def main():
         os.path.join(SCANNER_OUTPUT, 'IMG_*.JPG'),
         os.path.join(SCANNER_OUTPUT, 'topaz_IMG_*.jpg'),
         os.path.join(SCANNER_OUTPUT, 'topaz_IMG_*.JPG'),
+        os.path.join(SCANNER_OUTPUT, 'preserve_IMG_*.jpg'),
+        os.path.join(SCANNER_OUTPUT, 'preserve_IMG_*.JPG'),
     ]
     local_files = sorted(set(f for p in patterns for f in glob.glob(p)))
 
@@ -1377,9 +1427,9 @@ def main():
     print("Authenticating with Google Drive...")
     service = authenticate_drive()
 
-    # Step 3: Extract date prefix from the first scanner file (strip topaz_ prefix if present)
+    # Step 3: Extract date prefix from the first scanner file (ignoring any mode prefix)
     first_filename = os.path.basename(local_files[0])
-    first_filename_normalized = first_filename[6:] if first_filename.lower().startswith('topaz_') else first_filename
+    _, first_filename_normalized = split_mode_prefix(first_filename)
     date_match = re.match(r'IMG_(\d{8})_', first_filename_normalized)
     if not date_match:
         print(f"ERROR: First file doesn't match expected pattern: {first_filename}")
@@ -1394,9 +1444,7 @@ def main():
     # would conflict with what's already on Drive
     local_sequences = []
     for f in local_files:
-        name = os.path.basename(f)
-        if name.lower().startswith('topaz_'):
-            name = name[6:]
+        _, name = split_mode_prefix(os.path.basename(f))
         m = re.match(r'IMG_\d{8}_(\d{4})\.jpg', name, re.IGNORECASE)
         if m:
             local_sequences.append(int(m.group(1)))
@@ -1415,11 +1463,8 @@ def main():
         original_filename = os.path.basename(original_path)
         print(f"Processing [{i + 1}/{len(local_files)}]: {original_filename}")
 
-        # Check if this file is flagged for Topaz fallback
-        use_topaz = original_filename.lower().startswith('topaz_')
-
-        # Strip topaz_ prefix to get the base filename for processing
-        base_filename = original_filename[6:] if use_topaz else original_filename
+        # A filename prefix selects how this photo is processed
+        mode, base_filename = split_mode_prefix(original_filename)
 
         # Extract the date from the base filename
         file_date_match = re.match(r'IMG_(\d{8})_', base_filename)
@@ -1428,15 +1473,16 @@ def main():
             continue
         file_date = file_date_match.group(1)
 
-        if use_topaz:
-            # Topaz fallback: strip the topaz_ prefix, output with standard naming
-            # Input:  topaz_IMG_20260702_0015.jpg
+        if mode != 'xai':
+            # A prefixed file is a deliberate re-run of one photo, so it keeps its
+            # own sequence number and simply loses the prefix.
+            # Input:  preserve_IMG_20260702_0015.jpg
             # Output: IMG_20260702_0015_ai.jpg
             new_filename = base_filename
             new_path = os.path.join(SCANNER_OUTPUT, new_filename)
             if original_path != new_path:
                 os.rename(original_path, new_path)
-                print(f"  Renamed: {original_filename} -> {new_filename} (Topaz fallback)")
+                print(f"  Renamed: {original_filename} -> {new_filename} ({mode} requested)")
         else:
             # Normal flow: rename if needed to avoid sequence conflicts
             if needs_rename:
@@ -1462,20 +1508,30 @@ def main():
         if is_bw:
             print(f"  Detected as black & white image")
 
-        # Route to the face-preserving xAI pipeline (default) or Topaz (topaz_ prefix)
+        # Route according to the filename prefix. Unrestricted xAI is the default
+        # because it gives the best results on most photos; the masked pipeline is
+        # the remedy for the ones where xAI reworks faces past recognition.
         ai_path = os.path.join(SCANNER_OUTPUT, ai_filename)
-        if use_topaz:
-            # Topaz path is unchanged: whole-image dust removal, then Topaz.
+        prompt = COLORIZE_PROMPT if is_bw else ENHANCEMENT_PROMPT
+
+        if mode == 'preserve':
+            # Face-preserving pipeline; it applies its own face-masked dust removal.
+            print(f"  Using the face-preserving pipeline (requested via filename prefix)")
+            success = enhance_photo_pipeline(new_path, ai_path, colorize=is_bw)
+        else:
+            # xAI and Topaz both take a whole-image dust pass first.
             dust_removed_path = new_path.replace('.jpg', '_dr.jpg').replace('.JPG', '_dr.jpg')
             print(f"  Applying dust removal (MedianFilter size=3)...")
             apply_dust_removal(new_path, dust_removed_path)
-            print(f"  Using Topaz (fallback requested via filename prefix)")
-            success = enhance_with_topaz(dust_removed_path, ai_path)
+
+            if mode == 'topaz':
+                print(f"  Using Topaz (requested via filename prefix)")
+                success = enhance_with_topaz(dust_removed_path, ai_path)
+            else:
+                success = enhance_with_xai(dust_removed_path, ai_path, prompt)
+
             if os.path.exists(dust_removed_path):
                 os.remove(dust_removed_path)
-        else:
-            # 4-stage pipeline; it applies its own face-masked dust removal internally.
-            success = enhance_photo_pipeline(new_path, ai_path, colorize=is_bw)
 
         if success:
             # Upload both the original and enhanced version to Drive
