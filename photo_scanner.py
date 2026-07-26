@@ -226,19 +226,36 @@ def is_black_and_white(image_path, saturation_threshold=10):
 # Scanners cannot tell which way up a print was placed on the glass: these scans do
 # carry EXIF, but the Orientation tag is always 1 ("upright"), so it is useless here.
 #
-# Face detection supplies the signal instead. Detectors are strongly orientation
-# sensitive, which is normally a nuisance and here is exactly what is wanted — on a
-# test scan the correct rotation found 3 faces while all three wrong rotations found
-# zero. Probing four rotations and taking the clear winner recovered the right answer
-# in 4 of 4 trials.
+# Orientation is read from face GEOMETRY, not from whether detection succeeds.
 #
-# Photos with no people give no signal at all and are deliberately left untouched:
-# wrongly rotating a correct photo is worse than leaving a sideways one to fix by hand.
+# The first version of this counted faces at each of the four rotations, on the
+# theory that a detector only finds upright faces. That held on a scan with small
+# faces (3 found upright, 0 at every wrong rotation) but failed completely in
+# production: SCRFD is trained with rotation augmentation and finds large faces at
+# any angle, so real photos scored 3/2.4, 3/2.2, 3/2.4, 3/2.4 across the four
+# rotations — no signal at all, and one photo even scored highest at 270.
+#
+# Each detected face carries five keypoints: both eyes, nose, both mouth corners.
+# The vector from eye-midpoint to mouth-midpoint points "down" through the face, so
+# its direction gives that face's rotation directly. That is a measurement rather
+# than an inference from detector behaviour, it is unaffected by rotation-robust
+# detection, and it needs only one detection pass instead of four.
+#
+# Measured across 4 images x 4 rotations: 13 of 13 correct on every trial where
+# faces were found, at confidence 0.85-1.00.
+#
+# The old rotation probe survives as a fallback for the small-face case, where the
+# detector genuinely does fail at wrong rotations and so finds nothing to measure.
+#
+# Photos with no people give no signal either way and are deliberately left
+# untouched: wrongly rotating a correct photo is worse than leaving a sideways one.
 
 AUTO_ORIENT = True
 AUTO_ORIENT_DET_SIZE = 1024     # one scale is plenty to choose an orientation
 AUTO_ORIENT_MIN_SCORE = 0.5     # need at least one confident face before acting
-AUTO_ORIENT_MIN_MARGIN = 2.0    # winner must beat the runner-up by this factor
+AUTO_ORIENT_MIN_MARGIN = 2.0    # fallback probe: winner must beat runner-up by this
+AUTO_ORIENT_MIN_AGREEMENT = 0.6 # share of weighted votes the winning angle needs
+AUTO_ORIENT_MIN_EYE_MOUTH_PX = 3.0  # ignore faces whose keypoints are degenerate
 
 # Rotation that must be APPLIED to make the image upright.
 _CV_ROTATIONS = {
@@ -257,28 +274,81 @@ _PIL_ROTATIONS = {
 }
 
 
-def detect_orientation(image_bgr):
-    """Probe all four rotations and report which one makes the image upright.
+def _face_tilt(face):
+    """Direction of a face's eye-to-mouth axis in degrees, and its length.
 
-    Returns (degrees, scores). Degrees is 0 when the image already looks upright,
-    when no faces are found at any rotation, or when the result is too ambiguous
-    to act on.
+    An upright face reads +90: image y runs downward, and the mouth sits below the
+    eyes. The length doubles as a size proxy and a sanity check.
     """
+    kps = np.asarray(face.kps, dtype=np.float64)   # L-eye, R-eye, nose, L-mouth, R-mouth
+    axis = kps[[3, 4]].mean(axis=0) - kps[[0, 1]].mean(axis=0)
+    return float(np.degrees(np.arctan2(axis[1], axis[0]))), float(np.hypot(*axis))
+
+
+def measure_face_rotation(image_bgr):
+    """How far the image is rotated clockwise from upright, judged by face geometry.
+
+    Returns (degrees, agreement, face_count). Degrees is None when no usable face
+    was found. Agreement is the share of weighted votes behind the winning quarter
+    turn, so disagreement between faces surfaces rather than being averaged away.
+    """
+    faces = _get_face_analyzer(AUTO_ORIENT_DET_SIZE).get(image_bgr)
+
+    votes = {0: 0.0, 90: 0.0, 180: 0.0, 270: 0.0}
+    used = 0
+    for face in faces:
+        tilt, length = _face_tilt(face)
+        if length < AUTO_ORIENT_MIN_EYE_MOUTH_PX:
+            continue
+        # Weight by confidence and face size: big, certain faces should dominate.
+        weight = float(face.det_score) * length
+        votes[int(round(((tilt - 90.0) % 360.0) / 90.0) * 90) % 360] += weight
+        used += 1
+
+    total = sum(votes.values())
+    if not used or total == 0:
+        return None, 0.0, len(faces)
+
+    best = max(votes, key=votes.get)
+    return best, votes[best] / total, used
+
+
+def detect_orientation(image_bgr):
+    """Report the rotation that must be APPLIED to bring the image upright.
+
+    Reads face geometry first. Only if no face is measurable does it fall back to
+    probing the four rotations, which is the regime — small faces — where detection
+    really is orientation sensitive.
+
+    Returns (degrees, detail). Degrees is 0 when the image already looks upright or
+    the signal is too weak to act on.
+    """
+    rotated_by, agreement, count = measure_face_rotation(image_bgr)
+
+    if rotated_by is not None:
+        detail = f"geometry: {count} face(s), rotated {rotated_by}°, agreement {agreement:.2f}"
+        if agreement < AUTO_ORIENT_MIN_AGREEMENT:
+            return 0, detail + " — below threshold, left alone"
+        return (360 - rotated_by) % 360, detail
+
+    # No measurable face at the current orientation. Small faces do go undetected
+    # when sideways, so probing the other rotations can still find them.
     scores = {}
     for degrees, op in _CV_ROTATIONS.items():
         probe = image_bgr if op is None else cv2.rotate(image_bgr, op)
-        faces = _get_face_analyzer(AUTO_ORIENT_DET_SIZE).get(probe)
-        scores[degrees] = (len(faces), float(sum(f.det_score for f in faces)))
+        found = _get_face_analyzer(AUTO_ORIENT_DET_SIZE).get(probe)
+        scores[degrees] = (len(found), float(sum(f.det_score for f in found)))
 
     ranked = sorted(scores.items(), key=lambda kv: kv[1][1], reverse=True)
     best_degrees, (best_count, best_score) = ranked[0]
     runner_score = ranked[1][1][1]
+    detail = "probe: " + "  ".join(f"{d}:{n}/{s:.1f}" for d, (n, s) in sorted(scores.items()))
 
     if best_count == 0 or best_score < AUTO_ORIENT_MIN_SCORE:
-        return 0, scores        # no faces anywhere — no signal to act on
+        return 0, detail + " — no faces, left alone"
     if runner_score > 0 and best_score < AUTO_ORIENT_MIN_MARGIN * runner_score:
-        return 0, scores        # two orientations look plausible — leave it alone
-    return best_degrees, scores
+        return 0, detail + " — ambiguous, left alone"
+    return best_degrees, detail
 
 
 def auto_orient_file(path):
@@ -294,11 +364,10 @@ def auto_orient_file(path):
     if image is None:
         return 0
 
-    degrees, scores = detect_orientation(image)
-    summary = "  ".join(f"{d}:{n}/{s:.1f}" for d, (n, s) in sorted(scores.items()))
+    degrees, detail = detect_orientation(image)
 
     if degrees == 0:
-        print(f"  Orientation: upright or undetermined [{summary}]")
+        print(f"  Orientation: upright or undetermined [{detail}]")
         return 0
 
     # A 90/180/270 turn is lossless on the pixels themselves, but the file still has
@@ -320,7 +389,7 @@ def auto_orient_file(path):
     else:
         rotated.save(path, 'JPEG', quality=95)
 
-    print(f"  Orientation: rotated {degrees}° to upright [{summary}]")
+    print(f"  Orientation: rotated {degrees}° to upright [{detail}]")
     return degrees
 
 
