@@ -30,8 +30,10 @@
 # If verification fails, the photo is treated as a failure: nothing is uploaded and
 # the local file is kept so it can be retried or routed a different way.
 #
-# Both the default and Topaz routes use whole-image dust removal and are not
-# face-masked. Auto-orientation and black & white detection apply to every route.
+# Only the Topaz route applies dust removal, as its first step. The xAI routes send
+# the raw scan: median-filtering it first cost 74% of the input's fine detail to
+# remove dust that xAI strips anyway. Auto-orientation and black & white detection
+# apply to every route.
 #
 # Usage:
 #   python photo_scanner.py [--folder-id <DRIVE_FOLDER_ID>]
@@ -101,6 +103,35 @@ SCANNER_OUTPUT = '/Users/sreynoso/Pictures'
 # Config file takes precedence. See header comment for config file format.
 TOPAZ_API_KEY = None
 XAI_API_KEY = None
+
+# xAI image model. Edit XAI_MODEL below to switch between them.
+#
+#   grok-imagine-image
+#       The standard model, and what this script originally used. Materially
+#       weaker: on the same scan with the same prompt it measured 44.5 sharpness
+#       against the quality model's 228.5, and left small print as a coloured
+#       smudge where the quality model rendered it legibly.
+#
+#   grok-imagine-image-quality
+#       The quality model, pinned to whatever version that name currently resolves
+#       to. Measured 228.5 on the test scan.
+#
+#   grok-imagine-image-quality-latest        <-- ACTIVE
+#       The same quality model tracking the newest version rather than pinning.
+#       Verified working: 211.8 sharpness on the test scan. The spread against the
+#       pinned name is generative variance between calls, not a difference in
+#       capability.
+#
+# GET https://api.x.ai/v1/models returns the first two. The -latest alias is valid
+# but is not included in that listing.
+#
+# All three cap output at 1200px on the long edge, so the difference between them is
+# reconstruction quality rather than resolution.
+#
+# This model choice was the reason manual grok.com uploads looked dramatically
+# better than this script's output. Prompt wording and dust-removal pre-processing
+# were each tested first and neither made a visible difference; the model did.
+XAI_MODEL = 'grok-imagine-image-quality-latest'
 
 # xAI enhancement prompt.
 #
@@ -401,6 +432,22 @@ def detect_orientation(image_bgr):
         return 0, detail + " — no faces, left alone"
     if runner_score > 0 and best_score < AUTO_ORIENT_MIN_MARGIN * runner_score:
         return 0, detail + " — ambiguous, left alone"
+
+    # The probe only shows where a face is DETECTABLE, which is not the same as
+    # where it is upright — and treating them as the same rotated an already-upright
+    # photo. On a portrait where a cat partly occluded the subject's face, the
+    # detector found her only in the sideways orientation: zero faces upright, one
+    # at 270, so the probe turned a correct photo on its side.
+    #
+    # So the probe now only proposes, and geometry confirms. Rotating to the
+    # proposed orientation and measuring the face there must agree that it is
+    # upright; otherwise the photo is left alone.
+    candidate = (image_bgr if best_degrees == 0
+                 else cv2.rotate(image_bgr, _CV_ROTATIONS[best_degrees]))
+    residual, agreement, _ = measure_face_rotation(candidate)
+    if residual != 0 or agreement < AUTO_ORIENT_MIN_AGREEMENT:
+        return 0, detail + f" — probe unconfirmed by geometry (residual {residual}), left alone"
+
     return best_degrees, detail
 
 
@@ -478,7 +525,7 @@ def enhance_with_xai(input_path, output_path, prompt=None):
             'Authorization': f'Bearer {XAI_API_KEY}'
         },
         json={
-            'model': 'grok-imagine-image',
+            'model': XAI_MODEL,
             'prompt': prompt or ENHANCEMENT_PROMPT,
             'image': {
                 'url': f'data:image/jpeg;base64,{image_data}'
@@ -531,15 +578,14 @@ def enhance_with_xai(input_path, output_path, prompt=None):
 # alone. This pipeline enforces that guarantee mechanically instead:
 #
 #   Stage 1  Detect faces and build a pixel-precise mask.
-#   Stage 2  Enhance the image via xAI (faces are protected from dust removal
-#            beforehand, and overwritten afterward regardless of what xAI did).
-#   Stage 3  Fit the global tone curve the enhancement applied to the rest of the
-#            photo, and composite the ORIGINAL face pixels back through it.
-#   Stage 4  Verify the faces equal the graded original byte-for-byte under a
-#            monotonic curve; fail loudly otherwise.
+#   Stage 2  Enhance the raw scan via xAI, whatever it does to the faces.
+#   Stage 3  Rebuild the faces and composite them back: chroma entirely from xAI so
+#            each face matches its own surroundings, luminance weighted toward the
+#            scan so facial identity stays original.
+#   Stage 4  Verify the faces are exactly that blend, byte for byte; fail otherwise.
 #
-# Face pixels always derive from the RAW scan — dust removal is applied only
-# outside the mask, so facial texture is never median-filtered.
+# Face pixels always derive from the RAW scan, never from a dust-removed copy, so
+# facial texture is never median-filtered.
 #
 # Stage 3 originally pasted the face pixels back completely unmodified. That is a
 # stronger-sounding guarantee and it verified perfectly, but on a badly faded scan
@@ -657,7 +703,11 @@ def _get_face_analyzer(det_size):
     if det_size not in _FACE_ANALYZERS:
         from insightface.app import FaceAnalysis
         if not _FACE_ANALYZERS:
-            print("  Loading InsightFace model (first run downloads ~300MB)...")
+            # Say which it is, rather than warning about a 300MB download on every
+            # run when the models have been cached since the first one.
+            cached = os.path.isdir(os.path.expanduser('~/.insightface/models/buffalo_l'))
+            print("  Loading InsightFace model..." if cached
+                  else "  Downloading InsightFace model (~300MB, first run only)...")
         analyzer = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'],
                                 allowed_modules=FACE_MODULES)
         analyzer.prepare(ctx_id=-1, det_thresh=FACE_DET_THRESH, det_size=(det_size, det_size))
@@ -766,17 +816,6 @@ def generate_face_mask(image_bgr):
     alpha[strict_mask > 0] = 1.0
 
     return strict_mask, alpha, boxes
-
-
-def apply_masked_dust_removal(image_bgr, strict_mask):
-    """Median-filter the image everywhere except the strict face area.
-
-    Faces keep their raw scan texture; dust and specks elsewhere are smoothed.
-    """
-    filtered = cv2.medianBlur(image_bgr, 3)
-    core = strict_mask > 0
-    filtered[core] = image_bgr[core]
-    return filtered
 
 
 def enhance_via_xai_array(image_bgr, work_path, prompt=None):
@@ -1108,12 +1147,13 @@ def enhance_photo_pipeline(input_path: str, output_path: str, colorize: bool = F
         print(f"  Stage 1: no faces detected — enhancing the whole image")
 
     # ---- Stage 2: enhancement ----
-    # Faces are excluded from dust removal so their guarantee holds against the raw scan.
+    # The raw scan goes to xAI untouched. Median-filtering it first cost 74% of the
+    # input's fine detail (sharpness 39.3 -> 10.2) to remove dust the model strips
+    # anyway, which is a bad trade against a model that reconstructs fine detail.
     mode = 'colorize' if colorize else 'enhance'
-    print(f"  Stage 2: dust removal (outside faces) + xAI {mode}...")
-    prepared = apply_masked_dust_removal(original, strict_mask)
+    print(f"  Stage 2: xAI {mode}...")
     enhanced = enhance_via_xai_array(
-        prepared, os.path.splitext(output_path)[0],
+        original, os.path.splitext(output_path)[0],
         COLORIZE_PROMPT if colorize else ENHANCEMENT_PROMPT)
     if enhanced is None:
         print(f"  ERROR: Stage 2 enhancement failed")
@@ -1514,24 +1554,20 @@ def main():
         ai_path = os.path.join(SCANNER_OUTPUT, ai_filename)
         prompt = COLORIZE_PROMPT if is_bw else ENHANCEMENT_PROMPT
 
-        if mode == 'preserve':
-            # Face-preserving pipeline; it applies its own face-masked dust removal.
-            print(f"  Using the face-preserving pipeline (requested via filename prefix)")
-            success = enhance_photo_pipeline(new_path, ai_path, colorize=is_bw)
-        else:
-            # xAI and Topaz both take a whole-image dust pass first.
+        if mode == 'topaz':
+            # Topaz is the only route that gets dust removal, and it runs first.
             dust_removed_path = new_path.replace('.jpg', '_dr.jpg').replace('.JPG', '_dr.jpg')
             print(f"  Applying dust removal (MedianFilter size=3)...")
             apply_dust_removal(new_path, dust_removed_path)
-
-            if mode == 'topaz':
-                print(f"  Using Topaz (requested via filename prefix)")
-                success = enhance_with_topaz(dust_removed_path, ai_path)
-            else:
-                success = enhance_with_xai(dust_removed_path, ai_path, prompt)
-
+            print(f"  Using Topaz (requested via filename prefix)")
+            success = enhance_with_topaz(dust_removed_path, ai_path)
             if os.path.exists(dust_removed_path):
                 os.remove(dust_removed_path)
+        elif mode == 'preserve':
+            print(f"  Using the face-preserving pipeline (requested via filename prefix)")
+            success = enhance_photo_pipeline(new_path, ai_path, colorize=is_bw)
+        else:
+            success = enhance_with_xai(new_path, ai_path, prompt)
 
         if success:
             # Upload both the original and enhanced version to Drive
