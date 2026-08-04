@@ -1,47 +1,76 @@
 # Photo Scanner Automation
 
-A Python script that automates the end-to-end workflow for digitizing old family photos — from flatbed scanner output to AI-enhanced uploads on Google Drive. The script automatically detects black & white photos and produces a grayscale-enhanced version alongside the color-enhanced version, using the Pillow image library for local image processing.
+A Python script that automates the end-to-end workflow for digitizing old family photos — from flatbed scanner output to AI-enhanced uploads on Google Drive. It straightens sideways scans, colorizes black & white photographs, restores faded colour ones, and can protect faces from being redrawn by the AI when that matters.
 
 ## What It Does
 
-1. **Picks up scanned JPEGs** from the local scanner output folder (`~/Pictures`)
-2. **Detects conflicts** with files already on Google Drive and renames files to avoid duplicates
-3. **Detects black & white photos** automatically by measuring color saturation
-4. **Removes dust and scratches** using a Pillow MedianFilter (size=5) pre-processing step before AI enhancement
-5. **Enhances each photo** using xAI — correcting color casts, lifting shadows, boosting vibrance, and producing a modern, iPhone-like result while strictly preserving all facial features
-6. **Topaz fallback** — individual files can be routed to Topaz instead of xAI by prefixing the filename with `topaz_` (see Usage section)
-7. **Uploads to Google Drive** — both the original scan and the AI-enhanced version (and a grayscale-enhanced version for B&W photos)
-8. **Cleans up** local files after successful upload
+For every scan dropped into the watch folder:
+
+1. **Renames to avoid collisions** — checks Google Drive for the highest sequence number already used for that date and renumbers if needed
+2. **Straightens the scan** — detects orientation from the geometry of any faces in the photo and rotates it upright, in place
+3. **Detects black & white** photographs by measuring colour saturation
+4. **Enhances the photo** with xAI: restoring faded colour, correcting casts, lifting shadows, removing dust and scratches, and repairing print damage. Monochrome scans are colorized instead
+5. **Uploads both** the original scan and the enhanced version to Google Drive, plus a grayscale version of the enhancement for B&W photos
+6. **Cleans up** local files, but only for photos that completed the whole pipeline
+
+## Processing Modes
+
+How a photo is processed is chosen by its filename prefix. Rename a scan and drop it back in the watch folder to re-run it a different way — every mode writes the same output filename.
+
+| Input filename | Processed by |
+|---|---|
+| `IMG_20260702_0015.jpg` | xAI, unrestricted (default) |
+| `preserve_IMG_20260702_0015.jpg` | xAI, with the face-preserving pipeline |
+| `topaz_IMG_20260702_0015.jpg` | Topaz instead of xAI |
+
+Unrestricted xAI is the default because it gives the best results on most photos — it reconstructs detail and repairs damage freely. On some photos it reworks faces until people are no longer recognisable, and `preserve_` is the remedy for those.
+
+The prefix says only *how* to process the photo. Prefixed files are renumbered on sequence conflict exactly like unprefixed ones, so a prefix works equally well on a fresh scan or on a re-run of one you weren't happy with.
+
+### The face-preserving pipeline
+
+`preserve_` runs a four-stage pipeline instead of a single API call:
+
+1. **Detect** — InsightFace locates every face across several detector scales and builds a pixel-precise mask
+2. **Enhance** — the raw scan goes to xAI, whatever it does to the faces
+3. **Composite** — faces are rebuilt from the scan and laid back over the result. Colour comes entirely from xAI so each face matches its surroundings; luminance is weighted 70/30 toward the scan, so facial identity stays original while the scan's halftone and grain are lifted
+4. **Verify** — the composite is checked byte-for-byte against an independently recomputed face layer. If it doesn't match exactly, the photo is treated as a failure: nothing is uploaded and the local file is kept
+
+The blend is controlled by `FACE_XAI_LUMA_BLEND` (default `0.30`). Set it to `0.0` for facial detail entirely from your scan, higher for more of xAI's reconstruction.
 
 ## Output Files Per Photo
 
 | File | Description |
 |---|---|
-| `IMG_YYYYMMDD_NNNN.jpg` | Original scan |
-| `IMG_YYYYMMDD_NNNN_ai.jpg` | AI-enhanced color version |
-| `IMG_YYYYMMDD_NNNN_bw_ai.jpg` | AI-enhanced grayscale version (B&W photos only) |
+| `IMG_YYYYMMDD_NNNN.jpg` | Original scan, unmodified except for straightening |
+| `IMG_YYYYMMDD_NNNN_ai.jpg` | AI-enhanced (or colorized) version |
+| `IMG_YYYYMMDD_NNNN_bw_ai.jpg` | Grayscale version of the enhancement (B&W photos only) |
+
+The enhanced file comes back at whatever resolution xAI produces — currently capped around 1200px on the long edge — so it is smaller than the scan. The full-resolution original is uploaded alongside it.
 
 ## Requirements
 
-- Python 3.7+
+- Python — developed and tested on 3.13
 - A Google Cloud project with the **Google Drive API** enabled
-- OAuth 2.0 credentials file downloaded from the Google Cloud Console
-- A **Topaz API key** (obtain from [developer.topazlabs.com](https://developer.topazlabs.com))
-- An **xAI API key** (only required for xAI fallback)
-- **Pillow** for black & white photo detection and grayscale image processing
-- **launchctl** configured to monitor `~/Pictures` and trigger the script automatically when new scanned files are detected
+- OAuth 2.0 credentials downloaded from the Google Cloud Console
+- An **xAI API key** — required, this is the default enhancer
+- A **Topaz API key** — see the note below; currently required at startup even if you never use the `topaz_` prefix
+- **launchctl** (macOS) configured to watch the scan folder and trigger the script, if you want it to run automatically
+
+On first run, InsightFace downloads its face-detection models — about a 280MB download, occupying roughly 600MB in `~/.insightface` once unpacked. This happens once.
 
 ### Install dependencies
 
 ```bash
-pip install Pillow google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client requests
+pip install -r requirements.txt
 ```
 
 ## Setup
 
-1. Go to the [Google Cloud Console](https://console.cloud.google.com/) and enable the **Google Drive API**.
-2. Create OAuth 2.0 credentials (Desktop app) and save the file as `photo_scanner_automation_credentials.json` in the project folder.
-3. Create `~/.photo-scanner-config.json` in your home directory with your settings:
+1. Enable the **Google Drive API** in the [Google Cloud Console](https://console.cloud.google.com/).
+2. Create OAuth 2.0 credentials (Desktop app) and save them as `photo_scanner_automation_credentials.json` in the project folder.
+3. **Edit `SCANNER_OUTPUT` near the top of `photo_scanner.py`** to point at your scanner's output folder. It is currently hardcoded to a specific home directory.
+4. Create `~/.photo-scanner-config.json`:
    ```json
    {
      "folder_id": "your_google_drive_folder_id",
@@ -49,66 +78,47 @@ pip install Pillow google-auth google-auth-oauthlib google-auth-httplib2 google-
      "xai_api_key": "your_xai_api_key"
    }
    ```
-   The `xai_api_key` is optional — only needed if you use the xAI fallback feature.
-4. Configure launchctl to monitor `~/Pictures` and automatically trigger the script when new scanned files appear.
-   The launchctl plist should run: `python /path/to/photo_scanner.py` (no parameters needed — all settings are read from the config file).
+5. Optionally configure launchctl to watch the scan folder and run `python /path/to/photo_scanner.py` — no parameters needed, since everything is read from the config file.
 
-On first run, a browser window will open to authorize Google Drive access. The token is saved locally and refreshed automatically. If the token expires (e.g. after 7 days in test mode), the script will open the browser to re-authorize rather than failing.
+On first run a browser window opens to authorize Google Drive. The token is saved locally and refreshed automatically; if it expires, the script re-authorizes through the browser rather than failing.
 
 ## Usage
 
-Place scanned photos in `~/Pictures`, then run:
+Drop scanned photos in the watch folder, then run:
 
-```bash
-python photo_scanner.py --folder-id <DRIVE_FOLDER_ID>
-```
-
-### Configuration
-
-The script can be configured in two ways:
-
-#### Option 1: Command-line parameter
-```bash
-python photo_scanner.py --folder-id 1R5UhpYBe2nzZaf5T8qtAhHha76ajhRhO
-```
-
-#### Option 2: Config file (recommended — required for launchctl)
-
-The config file at `~/.photo-scanner-config.json` (in your home directory) stores all settings in one place, including API keys. This is the recommended approach and the only one that works with launchctl, since launchctl does not load your shell profile or environment variables.
-
-```json
-{
-  "folder_id": "1R5UhpYBe2nzZaf5T8qtAhHha76ajhRhO",
-  "topaz_api_key": "your_topaz_api_key",
-  "xai_api_key": "your_xai_api_key"
-}
-```
-
-(The `~` symbol represents your home directory. To show hidden files in Finder, press `Cmd + Shift + .`)
-
-Then run the script with no parameters:
 ```bash
 python photo_scanner.py
 ```
 
-If `--folder-id` is passed on the command line it takes precedence over the config file. API keys in the config file take precedence over environment variables.
+Or pass the Drive folder explicitly, which takes precedence over the config file:
 
-### Topaz Fallback
+```bash
+python photo_scanner.py --folder-id 1R5UhpYBe2nzZaf5T8qtAhHha76ajhRhO
+```
 
-If you want to route a specific photo through Topaz instead of xAI, prefix the filename with `topaz_` before dropping it in `~/Pictures`:
+The config file is the recommended approach and the only one that works under launchctl, which does not load your shell profile or environment variables. API keys in the config file take precedence over environment variables.
 
-| Input filename | Processed by | Output filename |
-|---|---|---|
-| `IMG_20260702_0015.jpg` | xAI (default) | `IMG_20260702_0015_ai.jpg` |
-| `topaz_IMG_20260702_0015.jpg` | Topaz (fallback) | `IMG_20260702_0015_ai.jpg` |
+(`~` is your home directory. To show hidden files in Finder, press `Cmd + Shift + .`)
 
-The `topaz_` prefix is stripped from the output filename automatically. Pillow dust removal runs first regardless of which enhancer is used.
+## Notes and Behaviour
 
-## Notes
+**Enhancement model.** Uses `grok-imagine-image-quality-latest`. The standard `grok-imagine-image` model is markedly weaker — on the same scan with the same prompt it produced roughly a fifth of the fine detail. `XAI_MODEL` near the top of the script documents all three options.
 
-- xAI is the default enhancer — it produces vivid, modern-looking results similar to an iPhone photo. The prompt is specifically tuned to preserve faces at the pixel level while aggressively enhancing everything else.
-- Pillow dust removal runs before every API call, giving the AI a cleaner input image.
-- Topaz is available as a fallback via the `topaz_` filename prefix if needed.
-- Only files that complete the full pipeline (original + AI enhancement + upload) are deleted locally.
-- The script is safe to re-run — it checks Drive for existing sequence numbers and avoids overwriting files.
-- Credential and token files are excluded from this repository via `.gitignore`.
+**Zero Data Retention.** Images are requested inline as base64 rather than as a URL, so xAI never stores the generated image. This is required for ZDR accounts and harmless otherwise.
+
+**Dust removal** runs only on the Topaz route. Median-filtering a scan costs about 74% of its fine detail to remove dust that xAI strips anyway, so the xAI routes send the raw scan untouched.
+
+**Black & white detection** switches the prompt from restoration to colorization. Detection triggers below an average saturation of 10, so a heavily sepia-toned print may be treated as a colour photo.
+
+**Auto-orientation** reads the direction of the eye-to-mouth axis on detected faces. It deliberately declines when the evidence is weak or the faces disagree, leaving the photo untouched rather than guessing — a wrong rotation is worse than a missed one. Photos without people cannot be oriented this way and need rotating by hand.
+
+**Failure is safe.** If enhancement or verification fails, nothing is uploaded and the local file is kept. Only photos that complete the entire pipeline are deleted locally.
+
+**Re-running a photo** produces a new sequence number rather than replacing the earlier version, so both sit on Drive and you delete the one you don't want.
+
+**Credential and token files** are excluded from this repository via `.gitignore`.
+
+### Known quirks
+
+- `SCANNER_OUTPUT` is hardcoded and must be edited before first use.
+- `TOPAZ_API_KEY` is validated at startup and the script exits without it, even though Topaz only runs when a file is prefixed `topaz_`. The xAI key, which the default path actually needs, is not validated.
