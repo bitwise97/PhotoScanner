@@ -529,7 +529,12 @@ def enhance_with_xai(input_path, output_path, prompt=None):
             'prompt': prompt or ENHANCEMENT_PROMPT,
             'image': {
                 'url': f'data:image/jpeg;base64,{image_data}'
-            }
+            },
+            # Ask for the image inline rather than as a URL. Serving a URL requires
+            # xAI to store the generated image, which a Zero Data Retention team is
+            # not permitted to do — without this the API rejects the request with
+            # "Zero Data Retention teams do not have access to URL format".
+            'response_format': 'b64_json'
         },
         timeout=120
     )
@@ -540,30 +545,28 @@ def enhance_with_xai(input_path, output_path, prompt=None):
         return False
 
     result = response.json()
+    payload = result.get('data') or [{}]
 
-    # The response should contain a URL to the enhanced image
-    if 'data' in result and len(result['data']) > 0:
-        image_url = result['data'][0].get('url')
-        if image_url:
-            # Download the enhanced image
-            img_response = requests.get(image_url, timeout=60)
-            if img_response.status_code == 200:
-                with open(output_path, 'wb') as f:
-                    f.write(img_response.content)
-                print(f"  Enhanced image saved: {os.path.basename(output_path)}")
-                return True
-            else:
-                print(f"  ERROR: Failed to download enhanced image")
-                return False
+    # Inline base64 is what we asked for, so check it first.
+    b64_data = payload[0].get('b64_json')
+    if b64_data:
+        with open(output_path, 'wb') as f:
+            f.write(base64.b64decode(b64_data))
+        print(f"  Enhanced image saved: {os.path.basename(output_path)}")
+        return True
 
-    # If response contains base64 data directly
-    if 'data' in result and len(result['data']) > 0:
-        b64_data = result['data'][0].get('b64_json')
-        if b64_data:
+    # A URL still works on accounts without Zero Data Retention, so it is kept as a
+    # fallback in case the API ever ignores response_format.
+    image_url = payload[0].get('url')
+    if image_url:
+        img_response = requests.get(image_url, timeout=60)
+        if img_response.status_code == 200:
             with open(output_path, 'wb') as f:
-                f.write(base64.b64decode(b64_data))
+                f.write(img_response.content)
             print(f"  Enhanced image saved: {os.path.basename(output_path)}")
             return True
+        print(f"  ERROR: Failed to download enhanced image")
+        return False
 
     print(f"  ERROR: Unexpected response format from xAI")
     print(f"  Response: {result}")
