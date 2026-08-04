@@ -1516,28 +1516,22 @@ def main():
             continue
         file_date = file_date_match.group(1)
 
-        if mode != 'xai':
-            # A prefixed file is a deliberate re-run of one photo, so it keeps its
-            # own sequence number and simply loses the prefix.
-            # Input:  preserve_IMG_20260702_0015.jpg
-            # Output: IMG_20260702_0015_ai.jpg
-            new_filename = base_filename
-            new_path = os.path.join(SCANNER_OUTPUT, new_filename)
-            if original_path != new_path:
-                os.rename(original_path, new_path)
-                print(f"  Renamed: {original_filename} -> {new_filename} ({mode} requested)")
+        # Every file goes through the same sequence-conflict check, prefixed or not.
+        # A prefix says how the photo should be processed, not that it is a re-run of
+        # one already numbered on Drive. Prefixed files used to skip this and keep
+        # their own number, which silently collided when a fresh scan was dropped in
+        # as topaz_IMG_..._0001 while 0001 and 0002 already existed on Drive.
+        if needs_rename:
+            new_seq = last_seq + i + 1
+            new_filename = f"IMG_{file_date}_{new_seq:04d}.jpg"
         else:
-            # Normal flow: rename if needed to avoid sequence conflicts
-            if needs_rename:
-                new_seq = last_seq + i + 1
-                new_filename = f"IMG_{file_date}_{new_seq:04d}.jpg"
-            else:
-                new_filename = original_filename
+            new_filename = base_filename
 
-            new_path = os.path.join(SCANNER_OUTPUT, new_filename)
-            if original_path != new_path:
-                os.rename(original_path, new_path)
-                print(f"  Renamed: {original_filename} -> {new_filename}")
+        new_path = os.path.join(SCANNER_OUTPUT, new_filename)
+        if original_path != new_path:
+            os.rename(original_path, new_path)
+            note = f" ({mode} requested)" if mode != 'xai' else ""
+            print(f"  Renamed: {original_filename} -> {new_filename}{note}")
 
         # Straighten the scan in place before anything reads it, so black & white
         # detection, the pipeline, and the original uploaded to Drive all work
