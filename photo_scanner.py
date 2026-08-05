@@ -1434,12 +1434,18 @@ def main():
         print('  { "folder_id": "<DRIVE_FOLDER_ID>", "topaz_api_key": "...", "xai_api_key": "..." }')
         return
 
-    if not TOPAZ_API_KEY:
-        print("ERROR: TOPAZ_API_KEY not found in config file or environment variables.")
-        print("Add 'topaz_api_key' to ~/.photo-scanner-config.json or set the TOPAZ_API_KEY environment variable.")
+    # xAI handles every route except topaz_, so its key is what a run actually needs.
+    # This used to check TOPAZ_API_KEY instead, which blocked anyone without a Topaz
+    # account from running at all while letting a missing xAI key through to fail as
+    # an opaque 401 mid-run, after files had already been renamed. The Topaz key is
+    # now checked lazily, only when a topaz_ file is about to be processed, so neither
+    # key is required unless it is used.
+    if not XAI_API_KEY:
+        print("ERROR: XAI_API_KEY not found in config file or environment variables.")
+        print("Add 'xai_api_key' to ~/.photo-scanner-config.json or set the XAI_API_KEY environment variable.")
         return
 
-    # Step 1: Find scanner output files — both normal (IMG_*) and xAI fallback (xAI_IMG_*)
+    # Step 1: Find scanner output files — unprefixed plus the topaz_ and preserve_ modes
     patterns = [
         os.path.join(SCANNER_OUTPUT, 'IMG_*.jpg'),
         os.path.join(SCANNER_OUTPUT, 'IMG_*.JPG'),
@@ -1550,6 +1556,15 @@ def main():
         # the remedy for the ones where xAI reworks faces past recognition.
         ai_path = os.path.join(SCANNER_OUTPUT, ai_filename)
         prompt = COLORIZE_PROMPT if is_bw else ENHANCEMENT_PROMPT
+
+        if mode == 'topaz' and not TOPAZ_API_KEY:
+            # Checked here rather than at startup so an xAI-only setup can run.
+            print(f"  ERROR: TOPAZ_API_KEY not found, but this file requests Topaz.")
+            print(f"  Add 'topaz_api_key' to ~/.photo-scanner-config.json, or remove "
+                  f"the topaz_ prefix to use xAI instead.")
+            failed_files.append(new_filename)
+            print()
+            continue
 
         if mode == 'topaz':
             # Topaz is the only route that gets dust removal, and it runs first.
