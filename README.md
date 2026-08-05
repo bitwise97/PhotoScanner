@@ -53,8 +53,8 @@ The enhanced file comes back at whatever resolution xAI produces — currently c
 - Python — developed and tested on 3.13
 - A Google Cloud project with the **Google Drive API** enabled
 - OAuth 2.0 credentials downloaded from the Google Cloud Console
-- An **xAI API key** — required, this is the default enhancer
-- A **Topaz API key** — see the note below; currently required at startup even if you never use the `topaz_` prefix
+- An **xAI API key** — required, this is the default enhancer, and checked at startup
+- A **Topaz API key** — only needed if you use the `topaz_` prefix
 - **launchctl** (macOS) configured to watch the scan folder and trigger the script, if you want it to run automatically
 
 On first run, InsightFace downloads its face-detection models — about a 280MB download, occupying roughly 600MB in `~/.insightface` once unpacked. This happens once.
@@ -121,4 +121,13 @@ The config file is the recommended approach and the only one that works under la
 ### Known quirks
 
 - `SCANNER_OUTPUT` is hardcoded and must be edited before first use.
-- `TOPAZ_API_KEY` is validated at startup and the script exits without it, even though Topaz only runs when a file is prefixed `topaz_`. The xAI key, which the default path actually needs, is not validated.
+
+## Tests
+
+```bash
+python tests/run_all.py
+```
+
+Runs in about a second and needs no API keys, no network, and no Google Drive access. Google Drive, both enhancement APIs and auto-orientation are stubbed out, and scans are generated into a temp directory — but the genuine `main()` runs, so the tests exercise the real filename sequencing, prefix routing and key-validation code rather than a copy of it.
+
+Exits non-zero if anything fails. Both modules cover bugs that reached production: prefixed files skipping the sequence-conflict check and colliding with files already on Drive, and the API-key validation that required the wrong key.
