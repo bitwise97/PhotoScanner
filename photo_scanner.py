@@ -167,11 +167,19 @@ COLOUR:
 - Keep colour believable for the period and the scene: full and natural, not neon.
 - Where an object still carries obvious colour of its own, keep that colour rather than repainting it as something else.
 
+FRAME — DO NOT EXTEND THE PHOTOGRAPH:
+- The output must show exactly the same extent of the scene as the input, edge to edge. Do not extend, outpaint, widen, or continue the scene beyond the borders of the original photograph.
+- Nothing may appear near the edges of the output that is not already visible in the input. If a person or object is cut off by the edge of the original, it stays cut off.
+- If the scan includes a paper margin, a white border, or scanner background around the photograph, that is not part of the scene. Crop to the photograph itself rather than painting scenery into the margin. Never invent content to fill it.
+
+REPAIR:
+- Damage inside the photograph may be repaired: where the print is torn, creased, stained or blemished within the image area, reconstruct what was plausibly behind it — a continuing wall, floor or sky.
+- This applies only to damage completely surrounded by the photograph. It never applies at or near the edges of the frame, where faded, blank or missing areas must be left as they are or cropped away, never filled in.
+
 GEOMETRY:
-- Keep the exact framing, aspect ratio, and placement. Do not crop, rotate, zoom, or reposition anything.
+- Keep the exact framing, aspect ratio, and placement. Do not crop into the scene, rotate, zoom, or reposition anything.
 - Keep every person and object at its original position, scale, and pose. Heads in particular must not move or change size.
 - Do not add, remove, or substitute any person, or invent objects that were not part of the scene.
-- Damage is not part of the scene. Where the print is torn, creased, stained, faded out, or distorted, reconstruct what was plausibly behind the damage — a continuing wall, floor, or sky — rather than preserving the damage or rendering it as some other object.
 
 TEXT:
 - Preserve any physically printed date or text exactly. Add no text, borders, or watermarks.
@@ -201,11 +209,19 @@ RESTORATION:
 - Remove dust, specks, scratches, creases, and haze.
 - Restore the contrast and clarity that fading has cost the image.
 
+FRAME — DO NOT EXTEND THE PHOTOGRAPH:
+- The output must show exactly the same extent of the scene as the input, edge to edge. Do not extend, outpaint, widen, or continue the scene beyond the borders of the original photograph.
+- Nothing may appear near the edges of the output that is not already visible in the input. If a person or object is cut off by the edge of the original, it stays cut off.
+- If the scan includes a paper margin, a white border, or scanner background around the photograph, that is not part of the scene. Crop to the photograph itself rather than painting scenery into the margin. Never invent content to fill it.
+
+REPAIR:
+- Damage inside the photograph may be repaired: where the print is torn, creased, stained or blemished within the image area, reconstruct what was plausibly behind it — a continuing wall, floor or sky.
+- This applies only to damage completely surrounded by the photograph. It never applies at or near the edges of the frame, where faded, blank or missing areas must be left as they are or cropped away, never filled in.
+
 GEOMETRY:
-- Keep the exact framing, aspect ratio, and placement. Do not crop, rotate, zoom, or reposition anything.
+- Keep the exact framing, aspect ratio, and placement. Do not crop into the scene, rotate, zoom, or reposition anything.
 - Keep every person and object at its original position, scale, and pose. Heads in particular must not move or change size.
 - Do not add, remove, or substitute any person, or invent objects that were not part of the scene.
-- Damage is not part of the scene. Where the print is torn, creased, stained, faded out, or distorted, reconstruct what was plausibly behind the damage — a continuing wall, floor, or sky — rather than preserving the damage or rendering it as some other object.
 
 TEXT:
 - Preserve any physically printed date or text exactly. Add no text, borders, or watermarks.
@@ -601,8 +617,19 @@ def enhance_with_xai(input_path, output_path, prompt=None):
 
 # Mask geometry, expressed as a fraction of each face's diagonal so the mask
 # scales with face size rather than image resolution.
-FACE_HULL_DILATE_RATIO = 0.08   # grow the landmark hull to cover hairline and neck junction
-FACE_FEATHER_RATIO = 0.06       # width of the soft transition ring OUTSIDE the strict mask
+#
+# The dilation started at 0.08, to grow the landmark hull out over the hairline and
+# neck junction that the 106-point contour stops short of. At 0.0 the mask is the
+# bare convex hull of those landmarks, which visibly overhung the face less. Note
+# that 0.0 is not as tight as it sounds: the hull spans the brow and jaw landmarks,
+# so it still carries some margin of its own. Going tighter would mean eroding the
+# hull, which the code does not currently do.
+#
+# Shrinking these trades overspill for leakage — too tight and the jawline, hairline
+# or chin fall outside the mask and are enhanced by xAI, which is subtle because it
+# appears at the edges of a face rather than across it.
+FACE_HULL_DILATE_RATIO = 0.0    # grow the landmark hull outward by this fraction
+FACE_FEATHER_RATIO = 0.01       # width of the soft transition ring OUTSIDE the strict mask
 
 # Detection is tuned hard for recall, because the two error types are not
 # symmetric: a false positive only leaves a small patch unenhanced, while a
@@ -647,16 +674,21 @@ FACE_LUMA_TOLERANCE = 0
 # How much of xAI's luminance is mixed into faces. 0.0 preserves the scan's facial
 # detail exactly; 1.0 hands faces over to xAI entirely.
 #
-# Strict preservation turned out to be visibly worse than it sounds. On real scans
-# the untouched face pixels carry halftone mesh and softness that the surrounding
-# photograph no longer has once xAI has reconstructed it, so a masked face reads as
-# damaged next to the same person's unmasked hands. A modest share of xAI luminance
-# lifts that without handing over facial identity: at 0.30 roughly seven tenths of
-# every feature is still the scan.
+# This ran at 0.30 for a while, on the theory that the scan's own halftone mesh and
+# softness would read as damage beside a background xAI had cleaned up, and that a
+# modest share of its luminance would lift that without surrendering facial
+# identity. On real 1970s scans that share was still visible as enhancement bleeding
+# into faces, which is the thing the mask exists to prevent, so it is now 0.0:
+# every bit of facial detail comes from the scan.
+#
+# The cost is that the scan's grain and softness are fully visible in faces against
+# a reconstructed background. If that ever reads as too rough, 0.10-0.15 recovers a
+# little polish while staying far more conservative than 0.30 was.
 #
 # Face chroma always comes wholly from xAI regardless of this weight, which is what
-# keeps a face the same colour as its own surroundings.
-FACE_XAI_LUMA_BLEND = 0.30
+# keeps a face the same colour as its own surroundings — that is what stops a
+# preserved face becoming an orange patch on a colour-corrected photograph.
+FACE_XAI_LUMA_BLEND = 0.0
 
 # Faces are deliberately excluded from median despeckling (set below 3 = off).
 #
@@ -1447,12 +1479,12 @@ def main():
 
     # Step 1: Find scanner output files — unprefixed plus the topaz_ and preserve_ modes
     patterns = [
-        os.path.join(SCANNER_OUTPUT, 'IMG_*.jpg'),
-        os.path.join(SCANNER_OUTPUT, 'IMG_*.JPG'),
-        os.path.join(SCANNER_OUTPUT, 'topaz_IMG_*.jpg'),
-        os.path.join(SCANNER_OUTPUT, 'topaz_IMG_*.JPG'),
-        os.path.join(SCANNER_OUTPUT, 'preserve_IMG_*.jpg'),
-        os.path.join(SCANNER_OUTPUT, 'preserve_IMG_*.JPG'),
+        os.path.join(SCANNER_OUTPUT, 'IMG*.jpg'),
+        os.path.join(SCANNER_OUTPUT, 'IMG*.JPG'),
+        os.path.join(SCANNER_OUTPUT, 'topaz_IMG*.jpg'),
+        os.path.join(SCANNER_OUTPUT, 'topaz_IMG*.JPG'),
+        os.path.join(SCANNER_OUTPUT, 'preserve_IMG*.jpg'),
+        os.path.join(SCANNER_OUTPUT, 'preserve_IMG*.JPG'),
     ]
     local_files = sorted(set(f for p in patterns for f in glob.glob(p)))
 
@@ -1480,10 +1512,13 @@ def main():
     first_filename = os.path.basename(local_files[0])
     _, first_filename_normalized = split_mode_prefix(first_filename)
     date_match = re.match(r'IMG_(\d{8})_', first_filename_normalized)
-    if not date_match:
-        print(f"ERROR: First file doesn't match expected pattern: {first_filename}")
+    if date_match:
+        date_prefix = date_match.group(1)
+    elif re.match(r'IMG\d+\.jpe?g$', first_filename_normalized, re.IGNORECASE):
+        date_prefix = time.strftime('%Y%m%d')
+    else:
+        print(f"ERROR: First file doesn't match either naming convention: {first_filename}")
         return
-    date_prefix = date_match.group(1)
 
     # Step 4: Get the last sequence number for this date from Drive
     last_seq = get_last_sequence_number(service, date_prefix, folder_id)
@@ -1517,17 +1552,25 @@ def main():
 
         # Extract the date from the base filename
         file_date_match = re.match(r'IMG_(\d{8})_', base_filename)
-        if not file_date_match:
+        if file_date_match:
+            file_date = file_date_match.group(1)
+            undated = False
+        elif re.match(r'IMG\d+\.jpe?g$', base_filename, re.IGNORECASE):
+            file_date = time.strftime('%Y%m%d')
+            undated = True
+        else:
             print(f"  WARNING: Filename doesn't match expected pattern, skipping: {original_filename}")
             continue
-        file_date = file_date_match.group(1)
 
         # Every file goes through the same sequence-conflict check, prefixed or not.
         # A prefix says how the photo should be processed, not that it is a re-run of
         # one already numbered on Drive. Prefixed files used to skip this and keep
         # their own number, which silently collided when a fresh scan was dropped in
         # as topaz_IMG_..._0001 while 0001 and 0002 already existed on Drive.
-        if needs_rename:
+        #
+        # Counter-style names (IMG00001.JPG) carry no date and no Drive sequence, so
+        # they are always renumbered onto today's date rather than kept.
+        if undated or needs_rename:
             new_seq = last_seq + i + 1
             new_filename = f"IMG_{file_date}_{new_seq:04d}.jpg"
         else:
