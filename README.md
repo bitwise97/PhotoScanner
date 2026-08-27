@@ -4,9 +4,9 @@ A Python script that automates the end-to-end workflow for digitizing old family
 
 ## What It Does
 
-For every scan dropped into the watch folder:
+Any `.jpg` or `.JPG` dropped into the watch folder is treated as a photo to process, whatever the scanner named it. For each one:
 
-1. **Renames to avoid collisions** — checks Google Drive for the highest sequence number already used for that date and renumbers if needed
+1. **Names it consistently** — a file already named `IMG_YYYYMMDD_NNNN.jpg` keeps its date and number unless that would collide with something already on Drive; anything else is dated today and given the next free number
 2. **Straightens the scan** — detects orientation from the geometry of any faces in the photo and rotates it upright, in place
 3. **Detects black & white** photographs by measuring colour saturation
 4. **Enhances the photo** with xAI: restoring faded colour, correcting casts, lifting shadows, removing dust and scratches, and repairing print damage. Monochrome scans are colorized instead
@@ -25,7 +25,7 @@ How a photo is processed is chosen by its filename prefix. Rename a scan and dro
 
 Unrestricted xAI is the default because it gives the best results on most photos — it reconstructs detail and repairs damage freely. On some photos it reworks faces until people are no longer recognisable, and `preserve_` is the remedy for those.
 
-The prefix says only *how* to process the photo. Prefixed files are renumbered on sequence conflict exactly like unprefixed ones, so a prefix works equally well on a fresh scan or on a re-run of one you weren't happy with.
+The prefix says only *how* to process the photo. It goes in front of whatever the file is already called — `topaz_IMG_9445.JPG` works as well as `topaz_IMG_20260702_0015.jpg` — and prefixed files are renumbered on sequence conflict exactly like unprefixed ones, so a prefix works equally well on a fresh scan or on a re-run of one you weren't happy with.
 
 ### The face-preserving pipeline
 
@@ -33,10 +33,12 @@ The prefix says only *how* to process the photo. Prefixed files are renumbered o
 
 1. **Detect** — InsightFace locates every face across several detector scales and builds a pixel-precise mask
 2. **Enhance** — the raw scan goes to xAI, whatever it does to the faces
-3. **Composite** — faces are rebuilt from the scan and laid back over the result. Colour comes entirely from xAI so each face matches its surroundings; luminance is weighted 70/30 toward the scan, so facial identity stays original while the scan's halftone and grain are lifted
+3. **Composite** — faces are rebuilt from the scan and laid back over the result. Colour comes entirely from xAI so each face matches its surroundings, while luminance comes entirely from your scan, so no facial detail is ever invented
 4. **Verify** — the composite is checked byte-for-byte against an independently recomputed face layer. If it doesn't match exactly, the photo is treated as a failure: nothing is uploaded and the local file is kept
 
-The blend is controlled by `FACE_XAI_LUMA_BLEND` (default `0.30`). Set it to `0.0` for facial detail entirely from your scan, higher for more of xAI's reconstruction.
+`FACE_XAI_LUMA_BLEND` controls the split, and defaults to `0.0` — facial detail entirely from your scan. It ran at `0.30` for a while, on the theory that a little of xAI's luminance would lift the scan's own grain and softness, but on badly faded scans that share was visible as enhancement bleeding into faces, which is the thing the mask exists to prevent. Raise it toward `0.10`–`0.15` if faces read as too rough against a reconstructed background.
+
+Two related constants shape the mask itself: `FACE_HULL_DILATE_RATIO` (`0.0`) grows the outline outward from the detected landmarks, and `FACE_FEATHER_RATIO` (`0.01`) sets the width of the soft transition ring just outside it. Shrinking them trades overspill around the face for leakage at its edges.
 
 ## Output Files Per Photo
 
@@ -116,11 +118,14 @@ The config file is the recommended approach and the only one that works under la
 
 **Re-running a photo** produces a new sequence number rather than replacing the earlier version, so both sit on Drive and you delete the one you don't want.
 
+**Renames happen as a batch**, before any photo is processed, and are staged through temporary names. Renaming files directly to their final names is unsafe: `os.rename` overwrites silently, so shifting a batch up by fewer positions than it has files makes each rename destroy a scan that has not been processed yet, and the damage cascades. Six unique scans once arrived on Drive as six copies of the first one, with the other five originals gone before they were ever uploaded.
+
 **Credential and token files** are excluded from this repository via `.gitignore`.
 
 ### Known quirks
 
 - `SCANNER_OUTPUT` is hardcoded and must be edited before first use.
+- Every JPEG in the watch folder is processed, uploaded and then **deleted locally**. Nothing else should be kept in that folder — unload the launchctl job first if you need to store ordinary JPEGs there.
 
 ## Tests
 
@@ -128,6 +133,12 @@ The config file is the recommended approach and the only one that works under la
 python tests/run_all.py
 ```
 
-Runs in about a second and needs no API keys, no network, and no Google Drive access. Google Drive, both enhancement APIs and auto-orientation are stubbed out, and scans are generated into a temp directory — but the genuine `main()` runs, so the tests exercise the real filename sequencing, prefix routing and key-validation code rather than a copy of it.
+24 cases, running in about a second, needing no API keys, no network, and no Google Drive access. Google Drive, both enhancement APIs and auto-orientation are stubbed out, and scans are generated into a temp directory — but the genuine `main()` runs, so the tests exercise the real filename sequencing, prefix routing and key-validation code rather than a copy of it. Exits non-zero if anything fails.
 
-Exits non-zero if anything fails. Both modules cover bugs that reached production: prefixed files skipping the sequence-conflict check and colliding with files already on Drive, and the API-key validation that required the wrong key.
+Every case covers a bug that reached production:
+
+- Prefixed files skipping the sequence-conflict check and colliding with files already on Drive
+- Counter-style names never being renamed, so they uploaded under the scanner's own filename
+- An unrecognised filename aborting the entire run rather than skipping one photo
+- API-key validation requiring the Topaz key while never checking the xAI one
+- The rename cascade that destroyed scans — checked by hashing the bytes each upload actually sends, since the filenames were all correct and only the images behind them were duplicated
