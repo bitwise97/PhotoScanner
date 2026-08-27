@@ -9,6 +9,7 @@ What remains unstubbed is the logic under test — filename sequencing, prefix r
 and API-key validation — running inside the genuine main().
 """
 import contextlib
+import hashlib
 import io
 import os
 import shutil
@@ -32,15 +33,21 @@ def sandbox(filenames, last_seq=0, xai_key='stub', topaz_key='stub'):
     """Run main() against generated scans in a temp dir. Yields a result dict.
 
     The result holds `uploaded` (names passed to Drive), `remaining` (files left on
-    disk, i.e. photos that failed and were correctly kept) and `output` (stdout).
+    disk, i.e. photos that failed and were correctly kept), `output` (stdout), and
+    `contents` mapping each uploaded name to a digest of the bytes actually sent.
+
+    Every generated scan is a different solid colour, so `contents` distinguishes
+    them. That matters because a rename bug can produce entirely plausible filenames
+    while the images behind them are duplicates of one another.
     """
     saved = {name: getattr(ps, name) for name in _PATCHED}
     tmp = tempfile.mkdtemp(prefix='photo-scanner-test-')
-    result = {'uploaded': [], 'remaining': [], 'output': ''}
+    result = {'uploaded': [], 'remaining': [], 'output': '', 'contents': {}}
 
     try:
-        for name in filenames:
-            pixels = np.random.default_rng(0).integers(60, 200, (240, 320, 3)).astype(np.uint8)
+        for index, name in enumerate(filenames):
+            shade = (index * 37 + 20) % 256
+            pixels = np.full((240, 320, 3), (shade, 255 - shade, 128), dtype=np.uint8)
             cv2.imwrite(os.path.join(tmp, name), pixels)
 
         def fake_enhance(src, dst, *args, **kwargs):
@@ -52,7 +59,12 @@ def sandbox(filenames, last_seq=0, xai_key='stub', topaz_key='stub'):
         ps.TOPAZ_API_KEY = topaz_key
         ps.authenticate_drive = lambda: object()
         ps.get_last_sequence_number = lambda service, date, folder: last_seq
-        ps.upload_to_drive = lambda service, path, name, folder: result['uploaded'].append(name)
+        def record_upload(service, path, name, folder):
+            result['uploaded'].append(name)
+            with open(path, 'rb') as handle:
+                result['contents'][name] = hashlib.md5(handle.read()).hexdigest()[:8]
+
+        ps.upload_to_drive = record_upload
         ps.auto_orient_file = lambda path: 0
         ps.load_config_file = lambda: {'folder_id': 'stub'}
         ps.enhance_with_xai = fake_enhance
@@ -76,6 +88,11 @@ def sandbox(filenames, last_seq=0, xai_key='stub', topaz_key='stub'):
 def originals(result):
     """Uploaded filenames excluding the _ai derivatives."""
     return [name for name in result['uploaded'] if '_ai' not in name]
+
+
+def distinct_uploaded_images(result):
+    """How many genuinely different images reached Drive, ignoring filenames."""
+    return len({result['contents'][name] for name in originals(result)})
 
 
 def first_error(result):

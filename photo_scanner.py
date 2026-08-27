@@ -112,11 +112,11 @@ XAI_API_KEY = None
 #       against the quality model's 228.5, and left small print as a coloured
 #       smudge where the quality model rendered it legibly.
 #
-#   grok-imagine-image-quality
+#   grok-imagine-image-quality        <-- ACTIVE
 #       The quality model, pinned to whatever version that name currently resolves
 #       to. Measured 228.5 on the test scan.
 #
-#   grok-imagine-image-quality-latest        <-- ACTIVE
+#   grok-imagine-image-quality-latest
 #       The same quality model tracking the newest version rather than pinning.
 #       Verified working: 211.8 sharpness on the test scan. The spread against the
 #       pinned name is generative variance between calls, not a difference in
@@ -131,7 +131,7 @@ XAI_API_KEY = None
 # This model choice was the reason manual grok.com uploads looked dramatically
 # better than this script's output. Prompt wording and dust-removal pre-processing
 # were each tested first and neither made a visible difference; the model did.
-XAI_MODEL = 'grok-imagine-image-quality-latest'
+XAI_MODEL = 'grok-imagine-image-quality'
 
 # xAI enhancement prompt.
 #
@@ -162,10 +162,11 @@ RESTORATION:
 - Remove dust, specks, scratches, creases and haze.
 - Restore the contrast, clarity and fine detail that fading has cost the image.
 
-COLOUR:
-- Every part of the photograph should end up properly coloured. Do not leave a region grey or washed out because the original is ambiguous — infer the most plausible colour for it and commit to that.
+COLOR:
+- Where fading has drained the colour out of something that had colour, rebuild it fully. Do not leave it pale or washed out just because the original is ambiguous — infer the most plausible colour and commit to it.
 - Keep colour believable for the period and the scene: full and natural, not neon.
-- Where an object still carries obvious colour of its own, keep that colour rather than repainting it as something else.
+- Faded colour is still colour. If an object retains any trace of its original hue — a painted vehicle, a dress, a painted wall — restore the strength of that hue rather than choosing a new one.
+- Some things are genuinely neutral, and they must stay neutral. A grey truck, a white wall, a black suit, bare metal, asphalt: restore their brightness and contrast, but never give them a colour they do not have. Grey that the photographer captured is not damage to be repaired.
 
 FRAME — DO NOT EXTEND THE PHOTOGRAPH:
 - The output must show exactly the same extent of the scene as the input, edge to edge. Do not extend, outpaint, widen, or continue the scene beyond the borders of the original photograph.
@@ -1477,14 +1478,20 @@ def main():
         print("Add 'xai_api_key' to ~/.photo-scanner-config.json or set the XAI_API_KEY environment variable.")
         return
 
-    # Step 1: Find scanner output files — unprefixed plus the topaz_ and preserve_ modes
+    # Step 1: Any JPEG in the scan folder is a photo to process.
+    #
+    # Matching on filename patterns meant every scanner naming convention had to be
+    # anticipated, and an unrecognised one did not merely skip that file — it aborted
+    # the whole run. IMG00001.JPG, IMG_9445.JPG and IMG_20260815_0033.jpg are three
+    # conventions seen from the same workflow. The extension is the only thing they
+    # reliably share, so it is the only thing checked here; the filename is consulted
+    # later only to decide whether a photo already carries a date and sequence.
+    #
+    # glob does not match leading dots, so the pipeline's own .staging_ temporaries
+    # are excluded automatically.
     patterns = [
-        os.path.join(SCANNER_OUTPUT, 'IMG*.jpg'),
-        os.path.join(SCANNER_OUTPUT, 'IMG*.JPG'),
-        os.path.join(SCANNER_OUTPUT, 'topaz_IMG*.jpg'),
-        os.path.join(SCANNER_OUTPUT, 'topaz_IMG*.JPG'),
-        os.path.join(SCANNER_OUTPUT, 'preserve_IMG*.jpg'),
-        os.path.join(SCANNER_OUTPUT, 'preserve_IMG*.JPG'),
+        os.path.join(SCANNER_OUTPUT, '*.jpg'),
+        os.path.join(SCANNER_OUTPUT, '*.JPG'),
     ]
     local_files = sorted(set(f for p in patterns for f in glob.glob(p)))
 
@@ -1508,17 +1515,12 @@ def main():
     print("Authenticating with Google Drive...")
     service = authenticate_drive()
 
-    # Step 3: Extract date prefix from the first scanner file (ignoring any mode prefix)
+    # Step 3: Date for this batch. A file already in the script's own convention
+    # carries its date; anything else is dated on import.
     first_filename = os.path.basename(local_files[0])
     _, first_filename_normalized = split_mode_prefix(first_filename)
     date_match = re.match(r'IMG_(\d{8})_', first_filename_normalized)
-    if date_match:
-        date_prefix = date_match.group(1)
-    elif re.match(r'IMG\d+\.jpe?g$', first_filename_normalized, re.IGNORECASE):
-        date_prefix = time.strftime('%Y%m%d')
-    else:
-        print(f"ERROR: First file doesn't match either naming convention: {first_filename}")
-        return
+    date_prefix = date_match.group(1) if date_match else time.strftime('%Y%m%d')
 
     # Step 4: Get the last sequence number for this date from Drive
     last_seq = get_last_sequence_number(service, date_prefix, folder_id)
@@ -1539,46 +1541,83 @@ def main():
     else:
         print(f"No conflicts: keeping original filenames\n")
 
-    # Step 5: Process each file
-    completed_files = []  # Only files that were fully processed (original + AI)
-    failed_files = []     # Files where enhancement failed
-
-    for i, original_path in enumerate(local_files):
+    # Step 5: Decide every final filename before moving anything.
+    #
+    # Every file goes through the same sequence-conflict check, prefixed or not. A
+    # prefix says how the photo should be processed, not that it is a re-run of one
+    # already numbered on Drive. Prefixed files used to skip this and keep their own
+    # number, which silently collided when a fresh scan was dropped in as
+    # topaz_IMG_..._0001 while 0001 and 0002 already existed on Drive.
+    #
+    # Counter-style names (IMG00001.JPG) carry no date and no Drive sequence, so they
+    # are always renumbered onto today's date rather than kept.
+    #
+    # The sequence counter advances only when a file is actually renumbered. Deriving
+    # it from the loop index instead let a renumbered file land on a number that a
+    # kept file already held.
+    planned = []           # (current_path, original_filename, final_filename, mode)
+    next_seq = last_seq
+    for original_path in local_files:
         original_filename = os.path.basename(original_path)
-        print(f"Processing [{i + 1}/{len(local_files)}]: {original_filename}")
-
-        # A filename prefix selects how this photo is processed
         mode, base_filename = split_mode_prefix(original_filename)
 
-        # Extract the date from the base filename
-        file_date_match = re.match(r'IMG_(\d{8})_', base_filename)
+        # A name already in the script's convention carries its own date and sequence
+        # and may keep them. Every other name — whatever the scanner produced — is
+        # dated today and renumbered, so no convention needs anticipating.
+        file_date_match = re.match(r'IMG_(\d{8})_(\d{4})\.jpe?g$', base_filename, re.IGNORECASE)
         if file_date_match:
             file_date = file_date_match.group(1)
             undated = False
-        elif re.match(r'IMG\d+\.jpe?g$', base_filename, re.IGNORECASE):
+        else:
             file_date = time.strftime('%Y%m%d')
             undated = True
-        else:
-            print(f"  WARNING: Filename doesn't match expected pattern, skipping: {original_filename}")
-            continue
 
-        # Every file goes through the same sequence-conflict check, prefixed or not.
-        # A prefix says how the photo should be processed, not that it is a re-run of
-        # one already numbered on Drive. Prefixed files used to skip this and keep
-        # their own number, which silently collided when a fresh scan was dropped in
-        # as topaz_IMG_..._0001 while 0001 and 0002 already existed on Drive.
-        #
-        # Counter-style names (IMG00001.JPG) carry no date and no Drive sequence, so
-        # they are always renumbered onto today's date rather than kept.
         if undated or needs_rename:
-            new_seq = last_seq + i + 1
-            new_filename = f"IMG_{file_date}_{new_seq:04d}.jpg"
+            next_seq += 1
+            final_filename = f"IMG_{file_date}_{next_seq:04d}.jpg"
         else:
-            new_filename = base_filename
+            final_filename = base_filename
 
-        new_path = os.path.join(SCANNER_OUTPUT, new_filename)
-        if original_path != new_path:
-            os.rename(original_path, new_path)
+        planned.append((original_path, original_filename, final_filename, mode))
+
+    # Move the batch in two phases, staging through temporary names.
+    #
+    # Renaming each file directly to its final name is unsafe, because os.rename
+    # overwrites the destination silently. Shifting a batch up by fewer positions than
+    # it has files makes each rename land on a scan that has not been processed yet
+    # and destroy it — and the damage cascades, because the next rename then moves the
+    # file that just overwrote its neighbour. Six unique scans with Drive's last
+    # sequence at 0001 came back as six copies of the first one, and the other five
+    # originals were gone from disk before they were ever uploaded.
+    #
+    # Staging every moving file through a unique temporary name first means the source
+    # and target sets never overlap, so the order of the moves cannot matter. The
+    # leading dot also keeps the temporaries out of the IMG* glob if a run is
+    # interrupted between the phases.
+    staged = []
+    for n, (current_path, original_filename, final_filename, mode) in enumerate(planned):
+        final_path = os.path.join(SCANNER_OUTPUT, final_filename)
+        if current_path == final_path:
+            staged.append((current_path, original_filename, final_filename, mode))
+            continue
+        temp_path = os.path.join(SCANNER_OUTPUT, f'.staging_{os.getpid()}_{n}.jpg')
+        os.rename(current_path, temp_path)
+        staged.append((temp_path, original_filename, final_filename, mode))
+
+    prepared = []
+    for current_path, original_filename, final_filename, mode in staged:
+        final_path = os.path.join(SCANNER_OUTPUT, final_filename)
+        if current_path != final_path:
+            os.rename(current_path, final_path)
+        prepared.append((final_path, original_filename, final_filename, mode))
+
+    # Step 6: Process each file
+    completed_files = []  # Only files that were fully processed (original + AI)
+    failed_files = []     # Files where enhancement failed
+
+    for i, (new_path, original_filename, new_filename, mode) in enumerate(prepared):
+        print(f"Processing [{i + 1}/{len(prepared)}]: {original_filename}")
+        if original_filename != new_filename:
             note = f" ({mode} requested)" if mode != 'xai' else ""
             print(f"  Renamed: {original_filename} -> {new_filename}{note}")
 
@@ -1646,7 +1685,7 @@ def main():
 
         print()  # Blank line between files
 
-    # Step 6: Clean up - only delete files that were fully processed
+    # Step 7: Clean up - only delete files that were fully processed
     if completed_files:
         print("Cleaning up completed files...")
         for f in completed_files:
