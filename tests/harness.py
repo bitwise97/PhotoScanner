@@ -69,7 +69,8 @@ def sandbox(filenames, last_seq=0, xai_key='stub', topaz_key='stub'):
         ps.load_config_file = lambda: {'folder_id': 'stub'}
         ps.enhance_with_xai = fake_enhance
         ps.enhance_with_topaz = fake_enhance
-        ps.enhance_photo_pipeline = lambda src, dst, colorize=False: fake_enhance(src, dst)
+        # **kwargs so the stub keeps working as the pipeline gains options
+        ps.enhance_photo_pipeline = lambda src, dst, **kwargs: fake_enhance(src, dst)
 
         sys.argv = ['photo_scanner.py', '--folder-id', 'stub']
         buffer = io.StringIO()

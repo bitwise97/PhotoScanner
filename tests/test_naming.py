@@ -43,6 +43,13 @@ def main():
         ('a prefix routes a counter name and still renames it',
          ['topaz_IMG00001.JPG'], 2, [f'IMG_{today}_0003.jpg']),
 
+        # preserveX2_ must not be swallowed by the preserve_ prefix that shares its
+        # opening characters, and is renumbered like every other mode.
+        ('preserveX2_ is renumbered past the conflict',
+         ['preserveX2_IMG_20260730_0001.jpg'], 2, ['IMG_20260730_0003.jpg']),
+        ('preserveX2_ on a counter name is dated and renumbered',
+         ['preserveX2_IMG00001.JPG'], 0, [f'IMG_{today}_0001.jpg']),
+
         # Any JPEG is accepted, whatever the scanner named it. Matching on filename
         # patterns meant an unrecognised convention aborted the entire run rather
         # than skipping one file — IMG_9445.JPG did exactly that.

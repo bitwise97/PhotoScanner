@@ -131,7 +131,7 @@ XAI_API_KEY = None
 # This model choice was the reason manual grok.com uploads looked dramatically
 # better than this script's output. Prompt wording and dust-removal pre-processing
 # were each tested first and neither made a visible difference; the model did.
-XAI_MODEL = 'grok-imagine-image-quality'
+XAI_MODEL = 'grok-imagine-image-quality-latest' #'grok-imagine-image-quality'
 
 # xAI enhancement prompt.
 #
@@ -156,25 +156,35 @@ XAI_MODEL = 'grok-imagine-image-quality'
 ENHANCEMENT_PROMPT = """Restore this scanned photograph. This is archival family history from the mid-20th century, badly faded by age. Be decisive: a timid restoration of a photo this degraded is a failed one.
 
 RESTORATION:
-- Neutralise the colour cast — usually amber, orange or magenta — that age has laid over the whole image.
-- Rebuild the colour that fading has drained away. Greens, blues, skin tones and fabrics should read as they would in a well-exposed photograph, not as pale ghosts of themselves.
-- Correct exposure, lift shadows, and recover blown highlights so the scene is evenly and naturally lit.
+- Neutralise the colour cast — usually amber, orange or magenta — that age has laid over the whole image. Judge the cast from things that are certainly white or grey — a white shirt, lace, the whites of eyes — and remove only that much. Never assume a wall or other painted surface is white: a wall that is pinker than a white shirt beside it is a pink wall, and stays pink.
+- Rebuild the colour that fading has drained away, so greens, blues, skin tones and fabrics read as they would in a well-exposed photograph. Recover their saturation without changing how light or dark they are.
+- Correct exposure and recover detail lost in deep shadow or blown highlights, without changing the lighting the photograph was taken in.
 - Remove dust, specks, scratches, creases and haze.
 - Restore the contrast, clarity and fine detail that fading has cost the image.
 
 COLOR:
-- Where fading has drained the colour out of something that had colour, rebuild it fully. Do not leave it pale or washed out just because the original is ambiguous — infer the most plausible colour and commit to it.
+- Where fading has drained the colour out of something that had colour, rebuild it fully. Do not leave it washed out just because the original is ambiguous — infer the most plausible colour and commit to it.
 - Keep colour believable for the period and the scene: full and natural, not neon.
-- Faded colour is still colour. If an object retains any trace of its original hue — a painted vehicle, a dress, a painted wall — restore the strength of that hue rather than choosing a new one.
-- Some things are genuinely neutral, and they must stay neutral. A grey truck, a white wall, a black suit, bare metal, asphalt: restore their brightness and contrast, but never give them a colour they do not have. Grey that the photographer captured is not damage to be repaired.
+- Faded colour is still colour. If an object retains any trace of its original hue — a painted vehicle, a dress, a painted wall — restore that hue rather than choosing a new one.
+- Some things are genuinely neutral, and they must stay neutral. A grey truck, a white shirt, a black suit, bare metal, asphalt: restore their brightness and contrast, but never give them a colour they do not have. Grey that the photographer captured is not damage to be repaired.
+- Where age has overwhelmed an object's colour completely, so that the only hue left is the cast's own, restore what the object is actually known to be rather than preserving the residue: living grass and foliage green, sky blue, skin its natural tone. An orange or magenta cast lying over grass is not the colour of the grass. Healthy grass should not come back brown or dead unless it is plainly dry and brown in a photograph that is otherwise correctly coloured.
+- Light colours must stay light. A pale blue dress, a cream shirt, a pastel wall: clear the cast and restore their clarity, but never deepen, darken or saturate them into a stronger colour than they are. Restoring a colour means recovering its saturation at the lightness it already has, not making it richer or darker. A subject lit directly by a flash is pale because the flash lit it, not because the photograph faded.
+
+LIGHTING — KEEP THE ORIGINAL CONDITIONS:
+- Restore the photograph without changing when or where it was taken. A picture taken at night with a flash must still look like night: the subjects lit by the flash, everything beyond them falling away into darkness.
+- Darkness that belongs to the scene is not underexposure. Do not light up a dark background, do not turn an outdoor scene into an indoor one, and do not turn night into day.
+- Keep the original light source and its direction. Flash falloff, hard shadows, and an unlit background are characteristics of the photograph, not faults to be corrected.
+- All of that applies to photographs that are genuinely dark. It is not a reason to darken a bright one. A sunlit outdoor scene must stay sunlit: do not crush its shadows, dim its daylight, or deepen its sky towards dusk. A washed-out photograph is brought back to a normal exposure, never pushed past one into evening. Judge the light the photograph was actually taken in and keep it — night stays night, and midday stays midday.
 
 FRAME — DO NOT EXTEND THE PHOTOGRAPH:
 - The output must show exactly the same extent of the scene as the input, edge to edge. Do not extend, outpaint, widen, or continue the scene beyond the borders of the original photograph.
 - Nothing may appear near the edges of the output that is not already visible in the input. If a person or object is cut off by the edge of the original, it stays cut off.
-- If the scan includes a paper margin, a white border, or scanner background around the photograph, that is not part of the scene. Crop to the photograph itself rather than painting scenery into the margin. Never invent content to fill it.
+- If the scan includes a paper margin, a white border, or scanner background around the photograph, that is not part of the scene and must be kept exactly as it is — the same width, the same position, the same plain paper colour. Never paint scenery into it and never remove it. The photograph ends where the border begins, and nothing beyond that edge may be invented.
 
 REPAIR:
-- Damage inside the photograph may be repaired: where the print is torn, creased, stained or blemished within the image area, reconstruct what was plausibly behind it — a continuing wall, floor or sky.
+- Damage inside the photograph may be repaired, but only by continuing a surface already clearly visible immediately around it — the same wall, floor, ground, sky, foliage or fabric, at the same scale and in the same plane.
+- Never build something new, and never enlarge what is there. A wall, fence, building, vehicle, person, animal or piece of furniture that is not already visible must not be introduced, and an existing structure must not be extended upward or outward beyond where it actually ends. A small fence stays a small fence.
+- A dark or unclear area is left dark and unclear. It is never filled with something merely because such a thing would be plausible there.
 - This applies only to damage completely surrounded by the photograph. It never applies at or near the edges of the frame, where faded, blank or missing areas must be left as they are or cropped away, never filled in.
 
 GEOMETRY:
@@ -206,17 +216,25 @@ COLORIZATION:
 - Something clearly meant to read as white or black — a white dress shirt, a black suit — may stay near neutral, but everything else must carry colour.
 
 RESTORATION:
-- Correct exposure and lift shadows so the scene reads as evenly and naturally lit.
+- Correct exposure and recover detail lost in deep shadow, without changing the lighting the photograph was taken in.
 - Remove dust, specks, scratches, creases, and haze.
 - Restore the contrast and clarity that fading has cost the image.
+
+LIGHTING — KEEP THE ORIGINAL CONDITIONS:
+- Restore the photograph without changing when or where it was taken. A picture taken at night with a flash must still look like night: the subjects lit by the flash, everything beyond them falling away into darkness.
+- Darkness that belongs to the scene is not underexposure. Do not light up a dark background, do not turn an outdoor scene into an indoor one, and do not turn night into day.
+- Keep the original light source and its direction. Flash falloff, hard shadows, and an unlit background are characteristics of the photograph, not faults to be corrected.
+- All of that applies to photographs that are genuinely dark. It is not a reason to darken a bright one. A sunlit outdoor scene must stay sunlit: do not crush its shadows, dim its daylight, or deepen its sky towards dusk. A washed-out photograph is brought back to a normal exposure, never pushed past one into evening. Judge the light the photograph was actually taken in and keep it — night stays night, and midday stays midday.
 
 FRAME — DO NOT EXTEND THE PHOTOGRAPH:
 - The output must show exactly the same extent of the scene as the input, edge to edge. Do not extend, outpaint, widen, or continue the scene beyond the borders of the original photograph.
 - Nothing may appear near the edges of the output that is not already visible in the input. If a person or object is cut off by the edge of the original, it stays cut off.
-- If the scan includes a paper margin, a white border, or scanner background around the photograph, that is not part of the scene. Crop to the photograph itself rather than painting scenery into the margin. Never invent content to fill it.
+- If the scan includes a paper margin, a white border, or scanner background around the photograph, that is not part of the scene and must be kept exactly as it is — the same width, the same position, the same plain paper colour. Never paint scenery into it and never remove it. The photograph ends where the border begins, and nothing beyond that edge may be invented.
 
 REPAIR:
-- Damage inside the photograph may be repaired: where the print is torn, creased, stained or blemished within the image area, reconstruct what was plausibly behind it — a continuing wall, floor or sky.
+- Damage inside the photograph may be repaired, but only by continuing a surface already clearly visible immediately around it — the same wall, floor, ground, sky, foliage or fabric, at the same scale and in the same plane.
+- Never build something new, and never enlarge what is there. A wall, fence, building, vehicle, person, animal or piece of furniture that is not already visible must not be introduced, and an existing structure must not be extended upward or outward beyond where it actually ends. A small fence stays a small fence.
+- A dark or unclear area is left dark and unclear. It is never filled with something merely because such a thing would be plausible there.
 - This applies only to damage completely surrounded by the photograph. It never applies at or near the edges of the frame, where faded, blank or missing areas must be left as they are or cropped away, never filled in.
 
 GEOMETRY:
@@ -521,6 +539,165 @@ def apply_dust_removal(input_path, output_path):
     result.save(output_path, 'JPEG', quality=95)
 
 # ============================================================
+# PRINT BORDERS
+# ============================================================
+#
+# Many prints carry a white or cream paper border. Sent to xAI as part of the image,
+# that margin is an invitation: told in the prompt to leave it alone, the model
+# outpainted into it anyway — on one scan inventing the top of a figure in a
+# painting that the border had cut off. Prompt wording failed on this twice.
+#
+# So the border never reaches xAI. It is detected, cropped off before enhancement,
+# and the enhanced photograph is pasted back inside the original border afterwards.
+# The margin in the output is the scan's own paper, untouched.
+#
+# A side counts as border only when a run of lines at the image edge is at least 90%
+# pale, low-saturation paper, and all four sides must have one. That is the guard
+# against cropping into a real photograph: an overcast sky can mimic a top border,
+# but not a border on every side. Measured on eight borderless scans, none was
+# detected as bordered.
+
+PRINT_BORDER_MAX_SAT = 70        # paper is low saturation (36-55 measured on aged cream stock)
+PRINT_BORDER_MIN_VAL = 200       # and bright (227+ measured)
+PRINT_BORDER_LINE_FRACTION = 0.90
+PRINT_BORDER_MIN_WIDTH = 0.004   # per side, as a fraction of the image dimension
+PRINT_BORDER_MAX_WIDTH = 0.25
+PRINT_BORDER_CORNER = 0.06       # rounded-corner window, fraction of the photo's shorter side
+PRINT_BORDER_EDGE = 0.015        # depth, fraction of the shorter side, of the band where
+                                 # border paper intruding past a skewed photo edge is restored
+
+
+def _paper_mask(image_bgr):
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    return (hsv[..., 1] < PRINT_BORDER_MAX_SAT) & (hsv[..., 2] > PRINT_BORDER_MIN_VAL)
+
+
+def detect_print_border(image_bgr):
+    """Return the photograph's rectangle (x1, y1, x2, y2) inside a paper border, or None."""
+    h, w = image_bgr.shape[:2]
+    paper = _paper_mask(image_bgr)
+
+    def leading_paper_lines(fractions):
+        count = 0
+        for fraction in fractions:
+            if fraction < PRINT_BORDER_LINE_FRACTION:
+                break
+            count += 1
+        return count
+
+    rows, cols = paper.mean(axis=1), paper.mean(axis=0)
+    top, bottom = leading_paper_lines(rows), leading_paper_lines(rows[::-1])
+    left, right = leading_paper_lines(cols), leading_paper_lines(cols[::-1])
+
+    for width, dimension in ((top, h), (bottom, h), (left, w), (right, w)):
+        if width < max(3, PRINT_BORDER_MIN_WIDTH * dimension) or width > PRINT_BORDER_MAX_WIDTH * dimension:
+            return None
+
+    x1, y1, x2, y2 = left, top, w - right, h - bottom
+    # A photograph that is itself mostly pale and colourless — snow, a white wall —
+    # could pass the edge test; reject it rather than crop into it.
+    if paper[y1:y2, x1:x2].mean() > 0.5:
+        return None
+    return x1, y1, x2, y2
+
+
+def paste_into_print_border(scan_bgr, box, enhanced_bgr):
+    """Place the enhanced photograph back inside the scan's own border.
+
+    The scan is scaled so its photo rectangle matches the enhanced image exactly,
+    so the enhanced pixels are pasted without being resampled — which matters on
+    the preserve_ route, where they have already been verified. Rounded print
+    corners survive because the paper curving into each corner of the rectangle is
+    restored from the scan.
+    """
+    x1, y1, x2, y2 = box
+    eh, ew = enhanced_bgr.shape[:2]
+    sx, sy = ew / float(x2 - x1), eh / float(y2 - y1)
+    h, w = scan_bgr.shape[:2]
+
+    px, py = int(round(x1 * sx)), int(round(y1 * sy))
+    out_w = px + ew + int(round((w - x2) * sx))
+    out_h = py + eh + int(round((h - y2) * sy))
+    canvas = cv2.resize(scan_bgr, (out_w, out_h), interpolation=cv2.INTER_AREA)
+    result = canvas.copy()
+    result[py:py + eh, px:px + ew] = enhanced_bgr
+
+    # Restoring anything merely pale and colourless was too loose: a sky is pale and
+    # colourless too, and on a black & white print 93% of it passed that test, so the
+    # sky touching the photo's top edge was restored from the scan in grey, blocky
+    # steps over the enhanced version. Paper is not just pale, it is a specific
+    # near-uniform colour, so restoration is limited to pixels close to the border's
+    # own median. Measured: the paper wedge sits within ~5 of it, the sky 24 away.
+    outside = np.ones(canvas.shape[:2], bool)
+    outside[py:py + eh, px:px + ew] = False
+    border_pixels = canvas[outside].reshape(-1, 3).astype(np.int16)
+    median = np.median(border_pixels, axis=0)
+    tolerance = min(20.0, max(12.0, 2.0 * float(border_pixels.std(axis=0).max())))
+    matches_paper_colour = np.all(np.abs(canvas.astype(np.int16) - median) <= tolerance, axis=2)
+
+    r = max(2, int(round(min(ew, eh) * PRINT_BORDER_CORNER)))
+    paper = (_paper_mask(canvas) & matches_paper_colour).astype(np.uint8)
+    for top, left, cy, cx in ((py, px, 0, 0), (py, px + ew - r, 0, r - 1),
+                              (py + eh - r, px, r - 1, 0), (py + eh - r, px + ew - r, r - 1, r - 1)):
+        window = paper[top:top + r, left:left + r].copy()
+        if window.shape != (r, r) or not window[cy, cx]:
+            continue
+        cv2.floodFill(window, np.zeros((r + 2, r + 2), np.uint8), (cx, cy), 2)
+        corner = window == 2
+        result[top:top + r, left:left + r][corner] = canvas[top:top + r, left:left + r][corner]
+
+    # A print is rarely scanned perfectly square, so a straight rectangle round a
+    # slightly skewed photo includes a thin wedge of paper along its long edges,
+    # widening toward one end. Left to the enhancer that wedge came back as a pale
+    # seam. Restore paper within a shallow band of the edge, but only where it is
+    # connected to the border itself — pale photo content that happens to sit near
+    # the edge, but is separated from the border, keeps its enhancement.
+    d = max(2, int(round(min(ew, eh) * PRINT_BORDER_EDGE)))
+    band = np.zeros(result.shape[:2], bool)
+    band[py:py + eh, px:px + ew] = True
+    band[py + d:py + eh - d, px + d:px + ew - d] = False
+    candidates = (band & paper.astype(bool)).astype(np.uint8)
+    _, labels = cv2.connectedComponents(candidates, connectivity=8)
+    rim = np.zeros(result.shape[:2], bool)
+    rim[py:py + eh, px:px + ew] = True
+    rim[py + 1:py + eh - 1, px + 1:px + ew - 1] = False
+    touching = np.unique(labels[rim & candidates.astype(bool)])
+    intruding = np.isin(labels, touching[touching != 0])
+    result[intruding] = canvas[intruding]
+    return result
+
+
+def enhance_within_print_border(src_path, dst_path, enhance):
+    """Run `enhance(src, dst)` on the photograph inside any paper border, then put
+    the border back. Scans without a border are passed straight through."""
+    scan = cv2.imread(src_path, cv2.IMREAD_COLOR)
+    box = detect_print_border(scan) if scan is not None else None
+    if box is None:
+        return enhance(src_path, dst_path)
+
+    x1, y1, x2, y2 = box
+    print(f"  Print border detected — enhancing the {x2 - x1}x{y2 - y1} photo inside it only")
+    # Leading dots keep these out of the *.jpg scan glob if a run is interrupted.
+    folder = os.path.dirname(dst_path)
+    photo_path = os.path.join(folder, f'.border_photo_{os.getpid()}.jpg')
+    enhanced_path = os.path.join(folder, f'.border_ai_{os.getpid()}.jpg')
+    try:
+        cv2.imwrite(photo_path, scan[y1:y2, x1:x2], [int(cv2.IMWRITE_JPEG_QUALITY), 98])
+        if not enhance(photo_path, enhanced_path):
+            return False
+        enhanced = cv2.imread(enhanced_path, cv2.IMREAD_COLOR)
+        if enhanced is None:
+            print(f"  ERROR: Could not read the enhanced photograph back")
+            return False
+        cv2.imwrite(dst_path, paste_into_print_border(scan, box, enhanced),
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        return True
+    finally:
+        for temp in (photo_path, enhanced_path):
+            if os.path.exists(temp):
+                os.remove(temp)
+
+# ============================================================
 # XAI ENHANCEMENT FUNCTION
 # ============================================================
 
@@ -629,7 +806,7 @@ def enhance_with_xai(input_path, output_path, prompt=None):
 # Shrinking these trades overspill for leakage — too tight and the jawline, hairline
 # or chin fall outside the mask and are enhanced by xAI, which is subtle because it
 # appears at the edges of a face rather than across it.
-FACE_HULL_DILATE_RATIO = 0.0    # grow the landmark hull outward by this fraction
+FACE_HULL_DILATE_RATIO = 0.04   # grow the landmark hull outward by this fraction
 FACE_FEATHER_RATIO = 0.01       # width of the soft transition ring OUTSIDE the strict mask
 
 # Detection is tuned hard for recall, because the two error types are not
@@ -644,6 +821,19 @@ FACE_FEATHER_RATIO = 0.01       # width of the soft transition ring OUTSIDE the 
 FACE_DET_SIZES = (640, 1024, 1600)
 FACE_DET_THRESH = 0.3           # below the 0.5 default; false positives are the cheap error
 FACE_DEDUPE_IOU = 0.4           # boxes overlapping more than this are the same face
+
+# The opt-in aggressive pass, enabled by the preserveX2_ prefix. A lower threshold
+# than the raw passes use, because the faces it is there to catch score below what
+# raw detection will admit at any scale.
+# Faces the scan hides but the enhanced image shows. Detection also runs on xAI's
+# output, and confident faces found only there are added to the mask. The floor is
+# high because weak detections on the enhanced image are unreliable: on one scan the
+# extras were a real child at 0.83, the same child again at 0.43, and a patch of
+# blurred background at 0.43. Anything already found in the scan is used as-is.
+FACE_ENHANCED_MIN_SCORE = 0.60
+
+FACE_DET_CLAHE_SIZE = 1024
+FACE_DET_CLAHE_THRESH = 0.20
 
 # buffalo_l ships five models; the mask only needs face boxes and the 106-point
 # contour. Loading the rest wastes time on every scale of every photo, and the
@@ -730,13 +920,15 @@ FACE_MAX_DETAIL_LOSS = 0.05                 # Stage 4 fails above this
 _FACE_ANALYZERS = {}
 
 
-def _get_face_analyzer(det_size):
-    """Lazily build an InsightFace analyzer per detector scale.
+def _get_face_analyzer(det_size, det_thresh=None):
+    """Lazily build an InsightFace analyzer per detector scale and threshold.
 
     Models download once to ~/.insightface; the analyzers are cached because
     prepare() is far more expensive than inference.
     """
-    if det_size not in _FACE_ANALYZERS:
+    det_thresh = FACE_DET_THRESH if det_thresh is None else det_thresh
+    key = (det_size, det_thresh)
+    if key not in _FACE_ANALYZERS:
         from insightface.app import FaceAnalysis
         if not _FACE_ANALYZERS:
             # Say which it is, rather than warning about a 300MB download on every
@@ -746,9 +938,9 @@ def _get_face_analyzer(det_size):
                   else "  Downloading InsightFace model (~300MB, first run only)...")
         analyzer = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'],
                                 allowed_modules=FACE_MODULES)
-        analyzer.prepare(ctx_id=-1, det_thresh=FACE_DET_THRESH, det_size=(det_size, det_size))
-        _FACE_ANALYZERS[det_size] = analyzer
-    return _FACE_ANALYZERS[det_size]
+        analyzer.prepare(ctx_id=-1, det_thresh=det_thresh, det_size=(det_size, det_size))
+        _FACE_ANALYZERS[key] = analyzer
+    return _FACE_ANALYZERS[key]
 
 
 def _iou(a, b):
@@ -763,23 +955,49 @@ def _iou(a, b):
     return inter / float(area_a + area_b - inter)
 
 
-def detect_faces_multiscale(image_bgr):
+def clahe_for_detection(image_bgr):
+    """A detection-only copy with local contrast lifted.
+
+    Contrast Limited Adaptive Histogram Equalization, applied to the lightness
+    channel in LAB so tonal contrast rises without any hue shifting. Equalizing in
+    small tiles pulls detail out of a flat, heavily cast scan that a global stretch
+    would leave buried; the contrast limit stops flat areas having their grain
+    amplified into speckle.
+
+    Used only to find faces. The mask, the composite and the verification all still
+    work from the untouched scan, so nothing here can reach the output.
+    """
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+    lab[:, :, 0] = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(lab[:, :, 0])
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
+def detect_faces_multiscale(image_bgr, aggressive=False):
     """Run detection at every scale in FACE_DET_SIZES and merge the results.
 
     Different scales surface different faces, so the union is taken and then
     deduplicated by IoU, keeping the highest-scoring detection of each face.
 
-    Detection runs on the raw scan deliberately. Normalizing the color cast and
-    equalizing contrast first (gray-world white balance + CLAHE) seemed like it
-    should help on faded photos, but measured on a badly degraded 1970s scan it
-    found no additional real faces and manufactured three false ones — CLAHE
-    amplifies fabric texture into face-like contrast. Raw detection found the same
-    six faces with zero false positives, including a background face at a higher
-    score (0.534) than the normalized pass gave it (0.350).
+    Detection runs on the raw scan by default. `aggressive` adds a pass over a
+    CLAHE-normalized copy at a lower threshold, which finds faces the raw passes
+    cannot — on one heavily faded scan a boy's face scored 0.21 there and was
+    invisible to every raw threshold and scale tried, down to 0.10.
+
+    That pass is opt-in because it is not free. Measured across nine real scans it
+    found one genuine face and about ten false ones, almost all on patterned fabric
+    — a polka-dot dress, folds of clothing, wall texture. Score cannot separate
+    them: the real face scored 0.21 while the false ones scored 0.22 to 0.27, above
+    it. Each false positive freezes a small patch out of enhancement, which is a
+    cheaper error than an AI-invented face but not one worth paying on every photo.
     """
     found = []
     for det_size in FACE_DET_SIZES:
         for face in _get_face_analyzer(det_size).get(image_bgr):
+            found.append(face)
+
+    if aggressive:
+        for face in _get_face_analyzer(FACE_DET_CLAHE_SIZE, FACE_DET_CLAHE_THRESH).get(
+                clahe_for_detection(image_bgr)):
             found.append(face)
 
     # Highest confidence first, so the detection kept for each face is the best one.
@@ -799,7 +1017,7 @@ def _odd(n):
     return n if n % 2 == 1 else n + 1
 
 
-def generate_face_mask(image_bgr):
+def generate_face_mask(image_bgr, aggressive=False, faces=None):
     """Stage 1 — detect every face and build the strict and feathered masks.
 
     Returns (strict_mask, alpha, boxes):
@@ -812,7 +1030,8 @@ def generate_face_mask(image_bgr):
     strict_mask = np.zeros((h, w), dtype=np.uint8)
     boxes = []
 
-    faces = detect_faces_multiscale(image_bgr)
+    if faces is None:
+        faces = detect_faces_multiscale(image_bgr, aggressive=aggressive)
 
     feather_px = 1  # grows with the largest face found; 1 keeps GaussianBlur valid if none are
     for face in faces:
@@ -831,8 +1050,21 @@ def generate_face_mask(image_bgr):
         face_mask = np.zeros((h, w), dtype=np.uint8)
         cv2.fillConvexPoly(face_mask, cv2.convexHull(points.astype(np.int32)), 255)
 
-        # Landmarks trace the face contour but stop short of the hairline and the
-        # neck junction, so grow the hull outward proportionally to face size.
+        # The 106-point contour runs from the brow around the jaw, with nothing above
+        # the eyebrows, so its hull systematically cuts the forehead off. On a weak
+        # detection the points also bunch together and the hull comes out both small
+        # and low — on one faded scan it left an eye outside the mask entirely.
+        #
+        # The detection box already spans the whole face, so an ellipse inscribed in
+        # it covers what the landmarks never reach and stays sane when they are
+        # unreliable. Unioning the two keeps the hull's tighter fit around the jaw
+        # where the landmarks are good.
+        cv2.ellipse(face_mask, ((x1 + x2) // 2, (y1 + y2) // 2),
+                    (max(1, (x2 - x1) // 2), max(1, (y2 - y1) // 2)),
+                    0, 0, 360, 255, -1)
+
+        # Then grow the whole thing a little, proportionally to face size, to reach
+        # the hairline and the neck junction.
         diag = float(np.hypot(x2 - x1, y2 - y1))
         grow = _odd(diag * FACE_HULL_DILATE_RATIO)
         face_mask = cv2.dilate(face_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow, grow)))
@@ -1147,7 +1379,8 @@ def verify_face_blend(face_source_bgr, enhanced_bgr, final_bgr, strict_mask,
     return (changed == 0 and detail_loss <= FACE_MAX_DETAIL_LOSS), changed, detail_loss
 
 
-def enhance_photo_pipeline(input_path: str, output_path: str, colorize: bool = False) -> bool:
+def enhance_photo_pipeline(input_path: str, output_path: str, colorize: bool = False,
+                           aggressive: bool = False) -> bool:
     """Enhance a photo while guaranteeing human faces are unchanged at the pixel level.
 
     Faces are detected and descreened at the scan's full resolution, then everything
@@ -1169,7 +1402,7 @@ def enhance_photo_pipeline(input_path: str, output_path: str, colorize: bool = F
     # ---- Stage 1: face mask ----
     print(f"  Stage 1: detecting faces...")
     try:
-        strict_mask, alpha, boxes = generate_face_mask(original)
+        strict_mask, alpha, boxes = generate_face_mask(original, aggressive=aggressive)
     except Exception as e:
         print(f"  ERROR: Face detection failed: {e}")
         return False
@@ -1195,12 +1428,6 @@ def enhance_photo_pipeline(input_path: str, output_path: str, colorize: bool = F
         print(f"  ERROR: Stage 2 enhancement failed")
         return False
 
-    # With no faces there is nothing to protect, so the enhanced result stands as-is.
-    if not boxes:
-        cv2.imwrite(output_path, enhanced, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-        print(f"  Enhanced image saved: {os.path.basename(output_path)}")
-        return True
-
     # Everything downstream works at xAI's output resolution rather than upscaling
     # its result to the scan's. That keeps the enhanced pixels unresampled and keeps
     # the _ai file the size it has always been. The cost is that face pixels are
@@ -1210,10 +1437,54 @@ def enhance_photo_pipeline(input_path: str, output_path: str, colorize: bool = F
     if (work_h, work_w) != (h, w):
         print(f"  xAI returned {work_w}x{work_h}; compositing at that resolution "
               f"(scan is {w}x{h})")
+
+    if boxes:
         strict_work = cv2.resize(strict_mask, (work_w, work_h), interpolation=cv2.INTER_NEAREST)
         alpha_work = cv2.resize(alpha, (work_w, work_h), interpolation=cv2.INTER_LINEAR)
+
+        # Detection on the scan can find most faces and miss one. Look in the
+        # enhanced image too and add any confident face that the scan's mask does
+        # not already cover — on one photo that recovered a child whose face was
+        # turned down, found at 0.83 there and at no threshold or scale in the scan.
+        scale_x, scale_y = work_w / float(w), work_h / float(h)
+        covered = [(int(x1 * scale_x), int(y1 * scale_y), int(x2 * scale_x), int(y2 * scale_y))
+                   for x1, y1, x2, y2 in boxes]
+        missed = [f for f in detect_faces_multiscale(enhanced, aggressive=aggressive)
+                  if float(getattr(f, 'det_score', 0.0)) >= FACE_ENHANCED_MIN_SCORE
+                  and all(_iou([int(v) for v in f.bbox], c) <= FACE_DEDUPE_IOU for c in covered)]
+        if missed:
+            extra_strict, extra_alpha, extra_boxes = generate_face_mask(enhanced, faces=missed)
+            strict_work = cv2.bitwise_or(strict_work, extra_strict)
+            alpha_work = np.maximum(alpha_work, extra_alpha)
+            print(f"  Stage 2: {len(missed)} more face(s) visible only in the enhanced image")
+            boxes = list(boxes) + [(int(x1 / scale_x), int(y1 / scale_y),
+                                    int(x2 / scale_x), int(y2 / scale_y))
+                                   for x1, y1, x2, y2 in extra_boxes]
     else:
-        strict_work, alpha_work = strict_mask, alpha
+        # A badly degraded scan can hide its faces from the detector entirely, and
+        # then the whole photograph — faces included — is enhanced unprotected. On
+        # one orange-washed scan no threshold or scale found either child, yet both
+        # were obvious at 0.90 confidence once xAI had restored the image.
+        #
+        # So look again in the enhanced image. Faces are located there and the mask
+        # is built in its coordinates, which is exactly where the composite happens
+        # anyway, so this needs no mapping back. The pixels composited in still come
+        # only from the scan; the enhancement is used to find the faces, never to
+        # supply them.
+        print(f"  Stage 2: no faces were visible in the scan — looking again in the "
+              f"enhanced image")
+        strict_work, alpha_work, boxes = generate_face_mask(enhanced, aggressive=aggressive)
+        if boxes:
+            scale_x, scale_y = w / float(work_w), h / float(work_h)
+            boxes = [(int(x1 * scale_x), int(y1 * scale_y), int(x2 * scale_x), int(y2 * scale_y))
+                     for x1, y1, x2, y2 in boxes]
+            coverage = 100.0 * np.count_nonzero(strict_work) / (work_h * work_w)
+            print(f"  Stage 2: {len(boxes)} face(s) found there, {coverage:.1f}% protected")
+        else:
+            print(f"  Stage 2: still no faces — enhancing the whole image")
+            cv2.imwrite(output_path, enhanced, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            print(f"  Enhanced image saved: {os.path.basename(output_path)}")
+            return True
 
     if not strict_work.any():
         # Every face shrank below a pixel — nothing left to protect or verify.
@@ -1390,6 +1661,7 @@ def enhance_with_topaz(input_path, output_path):
 
 MODE_PREFIXES = {
     'topaz_': 'topaz',
+    'preservex2_': 'preserve2',
     'preserve_': 'preserve',
 }
 
@@ -1657,11 +1929,17 @@ def main():
             success = enhance_with_topaz(dust_removed_path, ai_path)
             if os.path.exists(dust_removed_path):
                 os.remove(dust_removed_path)
-        elif mode == 'preserve':
-            print(f"  Using the face-preserving pipeline (requested via filename prefix)")
-            success = enhance_photo_pipeline(new_path, ai_path, colorize=is_bw)
+        elif mode in ('preserve', 'preserve2'):
+            aggressive = mode == 'preserve2'
+            print(f"  Using the face-preserving pipeline (requested via filename prefix)"
+                  + ("  [aggressive detection]" if aggressive else ""))
+            success = enhance_within_print_border(
+                new_path, ai_path,
+                lambda src, dst: enhance_photo_pipeline(src, dst, colorize=is_bw,
+                                                        aggressive=aggressive))
         else:
-            success = enhance_with_xai(new_path, ai_path, prompt)
+            success = enhance_within_print_border(
+                new_path, ai_path, lambda src, dst: enhance_with_xai(src, dst, prompt))
 
         if success:
             # Upload both the original and enhanced version to Drive

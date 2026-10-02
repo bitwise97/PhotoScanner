@@ -21,6 +21,7 @@ How a photo is processed is chosen by its filename prefix. Rename a scan and dro
 |---|---|
 | `IMG_20260702_0015.jpg` | xAI, unrestricted (default) |
 | `preserve_IMG_20260702_0015.jpg` | xAI, with the face-preserving pipeline |
+| `preserveX2_IMG_20260702_0015.jpg` | the same, with aggressive face detection |
 | `topaz_IMG_20260702_0015.jpg` | Topaz instead of xAI |
 
 Unrestricted xAI is the default because it gives the best results on most photos — it reconstructs detail and repairs damage freely. On some photos it reworks faces until people are no longer recognisable, and `preserve_` is the remedy for those.
@@ -38,7 +39,17 @@ The prefix says only *how* to process the photo. It goes in front of whatever th
 
 `FACE_XAI_LUMA_BLEND` controls the split, and defaults to `0.0` — facial detail entirely from your scan. It ran at `0.30` for a while, on the theory that a little of xAI's luminance would lift the scan's own grain and softness, but on badly faded scans that share was visible as enhancement bleeding into faces, which is the thing the mask exists to prevent. Raise it toward `0.10`–`0.15` if faces read as too rough against a reconstructed background.
 
-Two related constants shape the mask itself: `FACE_HULL_DILATE_RATIO` (`0.0`) grows the outline outward from the detected landmarks, and `FACE_FEATHER_RATIO` (`0.01`) sets the width of the soft transition ring just outside it. Shrinking them trades overspill around the face for leakage at its edges.
+Two related constants shape the mask itself: `FACE_HULL_DILATE_RATIO` (`0.04`) grows the outline outward from the detected landmarks, and `FACE_FEATHER_RATIO` (`0.01`) sets the width of the soft transition ring just outside it. Shrinking them trades overspill around the face for leakage at its edges — too tight and a hairline or jaw falls outside the mask and gets enhanced, which is subtle because it shows at the edges of a face rather than across it.
+
+### When a face is missed entirely
+
+A face the detector never finds gets no protection at all, and passes verification silently, because Stage 4 only checks pixels inside the mask. On badly faded scans this does happen — a boy turned three-quarters away in a near-monochrome red wash was invisible to every threshold and scale down to `0.10`.
+
+`preserveX2_` adds a detection pass over a CLAHE-normalised copy of the scan at a lower threshold, which found that face at score 0.21. Normalisation is used only to *locate* faces; the mask and everything composited back still come from the untouched scan.
+
+It's opt-in because it isn't free. Measured across nine real scans it found one genuine face and about ten false ones, nearly all on patterned fabric — a polka-dot dress, folds of clothing, wall texture. Score can't separate them: the real face scored 0.21 while the false positives scored 0.22–0.27, *above* it. Each false positive freezes a small patch out of enhancement, which is a far cheaper error than an AI-invented face, but not one worth paying on every photo.
+
+So use `preserve_` by default, and reach for `preserveX2_` on a photo where you can see a face was missed.
 
 ## Output Files Per Photo
 
@@ -108,6 +119,8 @@ The config file is the recommended approach and the only one that works under la
 
 **Zero Data Retention.** Images are requested inline as base64 rather than as a URL, so xAI never stores the generated image. This is required for ZDR accounts and harmless otherwise.
 
+**Print borders** are preserved exactly. A scan with a white or cream paper border is detected, the border is cropped off before the photo goes to xAI, and the enhanced photo is pasted back inside the scan's own border afterwards — including rounded corners, and the paper wedge left by a print scanned slightly askew. xAI never sees the border, because when it did, it outpainted into it: told in the prompt to leave the margin alone, it invented the top of a figure in a painting that the border had cut off. A border is only recognised when all four sides have one, so an overcast sky or a pale band along one edge isn't mistaken for paper.
+
 **Dust removal** runs only on the Topaz route. Median-filtering a scan costs about 74% of its fine detail to remove dust that xAI strips anyway, so the xAI routes send the raw scan untouched.
 
 **Black & white detection** switches the prompt from restoration to colorization. Detection triggers below an average saturation of 10, so a heavily sepia-toned print may be treated as a colour photo.
@@ -133,7 +146,7 @@ The config file is the recommended approach and the only one that works under la
 python tests/run_all.py
 ```
 
-24 cases, running in about a second, needing no API keys, no network, and no Google Drive access. Google Drive, both enhancement APIs and auto-orientation are stubbed out, and scans are generated into a temp directory — but the genuine `main()` runs, so the tests exercise the real filename sequencing, prefix routing and key-validation code rather than a copy of it. Exits non-zero if anything fails.
+36 cases, running in about a second, needing no API keys, no network, and no Google Drive access. Google Drive, both enhancement APIs and auto-orientation are stubbed out, and scans are generated into a temp directory — but the genuine `main()` runs, so the tests exercise the real filename sequencing, prefix routing and key-validation code rather than a copy of it. Exits non-zero if anything fails.
 
 Every case covers a bug that reached production:
 
@@ -141,4 +154,5 @@ Every case covers a bug that reached production:
 - Counter-style names never being renamed, so they uploaded under the scanner's own filename
 - An unrecognised filename aborting the entire run rather than skipping one photo
 - API-key validation requiring the Topaz key while never checking the xAI one
+- xAI outpainting into a print's paper border, invented content and all
 - The rename cascade that destroyed scans — checked by hashing the bytes each upload actually sends, since the filenames were all correct and only the images behind them were duplicated

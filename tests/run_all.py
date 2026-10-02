@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MODULES = ['test_naming.py', 'test_keys.py']
+MODULES = ['test_naming.py', 'test_keys.py', 'test_border.py']
 
 failed = 0
 for module in MODULES:
