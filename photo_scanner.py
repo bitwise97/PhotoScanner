@@ -8,21 +8,21 @@
 # it back in ~/Pictures to re-run it a different way; every route writes the same
 # output name, so IMG_20260702_0015_ai.jpg either way:
 #
-#   IMG_20260702_0015.jpg           xAI, unrestricted (default)
-#   preserve_IMG_20260702_0015.jpg  xAI, with the face-preserving pipeline
-#   topaz_IMG_20260702_0015.jpg     Topaz instead of xAI
+#   IMG_20260702_0015.jpg             xAI, faces unprotected (default)
+#   preserve_IMG_20260702_0015.jpg    xAI, with the face-preserving pipeline
+#   preserveX2_IMG_20260702_0015.jpg  the same, with aggressive face detection
 #
-# Unrestricted xAI is the default because it produces the best results on most
+# Faces unprotected is the default because it produces the best results on most
 # photos — it reconstructs detail and repairs damage freely. On some photos it
 # cannot resist reworking faces until people are no longer recognisable, and the
 # 'preserve_' prefix is the remedy for those:
 #
 #   Stage 1  InsightFace detects every face and builds a pixel-precise mask.
-#   Stage 2  Dust removal runs outside the mask only, then xAI enhances the image.
+#   Stage 2  xAI enhances the raw scan, whatever it does to the faces.
 #   Stage 3  Faces are rebuilt from the scan and composited back: chroma entirely
-#            from xAI so a face matches its surroundings, luminance weighted toward
-#            the scan so facial identity stays original. A soft transition ring sits
-#            just outside the strict face area.
+#            from xAI so a face matches its surroundings, luminance entirely from
+#            the scan so no facial detail is ever invented. A soft transition ring
+#            sits just outside the strict face area.
 #   Stage 4  The composite is verified byte-for-byte as a lossless PNG, proving the
 #            face is exactly that blend and nothing else; the PNG is then converted
 #            to the final JPEG and discarded.
@@ -30,17 +30,23 @@
 # If verification fails, the photo is treated as a failure: nothing is uploaded and
 # the local file is kept so it can be retried or routed a different way.
 #
-# Only the Topaz route applies dust removal, as its first step. The xAI routes send
-# the raw scan: median-filtering it first cost 74% of the input's fine detail to
-# remove dust that xAI strips anyway. Auto-orientation and black & white detection
+# The raw scan goes to xAI untouched. Median-filtering it first to remove dust cost
+# 74% of the input's fine detail to remove specks the model strips anyway, so that
+# pre-processing step was removed. Auto-orientation and black & white detection
 # apply to every route.
 #
 # Usage:
 #   python photo_scanner.py [--folder-id <DRIVE_FOLDER_ID>]
+#   python photo_scanner.py --reprocess <FILENAME> [--mode <ROUTE>]
 #
 # Parameters (optional):
 #   --folder-id    The Google Drive folder ID for the current album.
 #                  (Found in the folder's URL: drive.google.com/drive/folders/<ID>)
+#   --reprocess    Re-enhance a photo already on Drive, given its original scan
+#                  name, replacing its _ai files in place. The original itself is
+#                  read-only on this path and auto-orientation is skipped, since
+#                  the photo on Drive was straightened when first processed.
+#   --mode         Route for --reprocess: xai (default), preserve, preservex2.
 #
 # Configuration:
 #   The script reads settings from ~/.photo-scanner-config.json
@@ -49,12 +55,11 @@
 #
 #   Config file format:
 #   {
-#     "folder_id":    "<DRIVE_FOLDER_ID>",
-#     "topaz_api_key": "<TOPAZ_API_KEY>",
-#     "xai_api_key":  "<XAI_API_KEY>"
+#     "folder_id":   "<DRIVE_FOLDER_ID>",
+#     "xai_api_key": "<XAI_API_KEY>"
 #   }
 #
-#   API keys can also be set as environment variables (TOPAZ_API_KEY, XAI_API_KEY).
+#   The API key can also be set as an environment variable (XAI_API_KEY).
 #   The config file takes precedence over environment variables.
 #
 # Examples:
@@ -71,21 +76,25 @@
 #     re-authorize automatically via browser rather than failing.
 
 import argparse
+import io
 import json
 import os
 import re
 import glob
 import base64
 import requests
+import shutil
+import sys
+import tempfile
 import time
 import cv2
 import numpy as np
-from PIL import Image, ImageFilter, JpegImagePlugin
+from PIL import Image, JpegImagePlugin
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 # ============================================================
 # CONFIGURATION - Update these as needed
@@ -99,9 +108,8 @@ TOKEN_FILE = os.path.expanduser('~/photo-scanner/token.json')
 # Local scanner output folder
 SCANNER_OUTPUT = '/Users/sreynoso/Pictures'
 
-# API keys — loaded from ~/.photo-scanner-config.json or environment variables.
+# API key — loaded from ~/.photo-scanner-config.json or the environment.
 # Config file takes precedence. See header comment for config file format.
-TOPAZ_API_KEY = None
 XAI_API_KEY = None
 
 # xAI image model. Edit XAI_MODEL below to switch between them.
@@ -112,26 +120,28 @@ XAI_API_KEY = None
 #       against the quality model's 228.5, and left small print as a coloured
 #       smudge where the quality model rendered it legibly.
 #
-#   grok-imagine-image-quality        <-- ACTIVE
-#       The quality model, pinned to whatever version that name currently resolves
-#       to. Measured 228.5 on the test scan.
+#   grok-imagine-image-quality        (retired 2026-11-02)
+#       Legacy name now maps to grok-imagine-image-2.0 at quality: low.
 #
-#   grok-imagine-image-quality-latest
-#       The same quality model tracking the newest version rather than pinning.
-#       Verified working: 211.8 sharpness on the test scan. The spread against the
-#       pinned name is generative variance between calls, not a difference in
-#       capability.
+#   grok-imagine-image-quality-latest  (retired 2026-11-02)
+#       Same retirement — legacy name maps to grok-imagine-image-2.0 at quality: low.
 #
-# GET https://api.x.ai/v1/models returns the first two. The -latest alias is valid
-# but is not included in that listing.
+#   grok-imagine-image-2.0            <-- ACTIVE
+#       Replacement for the quality model. quality: auto (the default) selects the
+#       highest tier automatically, equivalent to the old quality model behaviour.
+#       Calling the model directly avoids the quality: low downgrade applied when
+#       going through the retired legacy names. $0.01 cheaper per image than before.
 #
-# All three cap output at 1200px on the long edge, so the difference between them is
+# GET https://api.x.ai/v1/models returns the available models.
+#
+# All models cap output at 1200px on the long edge, so the difference between them is
 # reconstruction quality rather than resolution.
 #
 # This model choice was the reason manual grok.com uploads looked dramatically
 # better than this script's output. Prompt wording and dust-removal pre-processing
 # were each tested first and neither made a visible difference; the model did.
-XAI_MODEL = 'grok-imagine-image-quality-latest' #'grok-imagine-image-quality'
+XAI_MODEL = 'grok-imagine-image-quality-latest'  # switch to grok-imagine-image-2.0 once xAI grants team access
+XAI_QUALITY = 'auto'  # auto = highest quality tier; low/medium/high also accepted (used with grok-imagine-image-2.0)
 
 # xAI enhancement prompt.
 #
@@ -247,17 +257,6 @@ TEXT:
 
 Output only the restored photograph."""
 
-# Topaz enhancement prompt (max 1024 characters — condensed version of the xAI prompt)
-TOPAZ_PROMPT = ("Restore this old scanned photograph. "
-                "Remove scratches, dust, creases, and haze. "
-                "Correct color casts and remove yellowing and fading. "
-                "Boost color vibrance and saturation for a vivid, modern look. "
-                "Balance lighting for even, natural exposure. "
-                "Do not alter faces in any way — preserve all facial features exactly. "
-                "Do not invent details not visible in the original. "
-                "Preserve original composition and framing. "
-                "Preserve any physically printed dates or text exactly as they appear.")
-
 # ============================================================
 # GOOGLE DRIVE FUNCTIONS
 # ============================================================
@@ -320,6 +319,52 @@ def upload_to_drive(service, local_path, filename, folder_id):
     ).execute()
     print(f"  Uploaded to Drive: {uploaded['name']}")
     return uploaded
+
+
+def find_drive_files(service, folder_id, filename):
+    """Every non-trashed file in the album folder with this exact name.
+
+    Returns a list, because Drive permits duplicate names within one folder.
+    Callers that are about to overwrite something must treat more than one match
+    as ambiguous rather than picking one.
+    """
+    escaped = filename.replace('\\', '\\\\').replace("'", "\\'")
+    results = service.files().list(
+        q=f"'{folder_id}' in parents and name = '{escaped}' and trashed = false",
+        fields='files(id, name, size)',
+        pageSize=10
+    ).execute()
+    return results.get('files', [])
+
+
+def download_from_drive(service, file_id, local_path):
+    """Download a Drive file's content to a local path."""
+    request = service.files().get_media(fileId=file_id)
+    with io.FileIO(local_path, 'wb') as handle:
+        downloader = MediaIoBaseDownload(handle, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+    return local_path
+
+
+def replace_on_drive(service, file_id, local_path):
+    """Replace a Drive file's content in place, keeping its ID, name and created date.
+
+    Drive retains the superseded bytes as a non-head revision and purges them
+    automatically 30 days after this upload, which is what makes a reprocess
+    undoable without any bookkeeping here. Nothing in this script deletes those
+    revisions; letting them expire on their own is deliberate.
+    """
+    media = MediaFileUpload(local_path, mimetype='image/jpeg')
+    updated = service.files().update(
+        fileId=file_id,
+        media_body=media,
+        fields='id, name, size'
+    ).execute()
+    print(f"  Replaced on Drive: {updated['name']}")
+    return updated
+
 
 def is_black_and_white(image_path, saturation_threshold=10):
     """Detect if an image is black and white by checking average color saturation."""
@@ -529,16 +574,6 @@ def auto_orient_file(path):
 
 
 # ============================================================
-# DUST REMOVAL (PRE-PROCESSING)
-# ============================================================
-
-def apply_dust_removal(input_path, output_path):
-    """Apply a median filter to remove dust and scratch specks before AI enhancement."""
-    img = Image.open(input_path)
-    result = img.filter(ImageFilter.MedianFilter(size=3))  # size must be odd; 3=subtle, 5=moderate, 7=aggressive
-    result.save(output_path, 'JPEG', quality=95)
-
-# ============================================================
 # PRINT BORDERS
 # ============================================================
 #
@@ -720,6 +755,7 @@ def enhance_with_xai(input_path, output_path, prompt=None):
         },
         json={
             'model': XAI_MODEL,
+            **({'quality': XAI_QUALITY} if XAI_MODEL == 'grok-imagine-image-2.0' else {}),
             'prompt': prompt or ENHANCEMENT_PROMPT,
             'image': {
                 'url': f'data:image/jpeg;base64,{image_data}'
@@ -781,8 +817,8 @@ def enhance_with_xai(input_path, output_path, prompt=None):
 #            scan so facial identity stays original.
 #   Stage 4  Verify the faces are exactly that blend, byte for byte; fail otherwise.
 #
-# Face pixels always derive from the RAW scan, never from a dust-removed copy, so
-# facial texture is never median-filtered.
+# Face pixels always derive from the RAW scan, so facial texture is never filtered
+# or pre-processed on its way through.
 #
 # Stage 3 originally pasted the face pixels back completely unmodified. That is a
 # stronger-sounding guarantee and it verified perfectly, but on a badly faded scan
@@ -821,6 +857,22 @@ FACE_FEATHER_RATIO = 0.01       # width of the soft transition ring OUTSIDE the 
 FACE_DET_SIZES = (640, 1024, 1600)
 FACE_DET_THRESH = 0.3           # below the 0.5 default; false positives are the cheap error
 FACE_DEDUPE_IOU = 0.4           # boxes overlapping more than this are the same face
+
+# Detection runs on a copy no larger than this on the long edge. The detector never
+# looks at more than max(FACE_DET_SIZES) anyway — it resizes internally — so handing
+# it a 4717x5400 scan means that resize discards 3.4x the pixels, and on a grainy
+# print it aliases grain into structure that reads as facial texture. Downscaling
+# here with INTER_AREA averages the grain instead.
+#
+# Measured over 12 real scans, 52 detections: full resolution gave 5 false positives
+# with the lowest real face at 0.51 and the highest false at 0.45, a margin of 0.06.
+# At 1600 that became 2 false positives, lowest real 0.54, highest false 0.39 — a
+# margin of 0.16, with all 12 real faces still found. On the scan that prompted this,
+# four false positives on a belly, a forearm and a pair of knees became one.
+#
+# 1600 rather than lower because it matches the largest det_size, so nothing the
+# detector could actually have used is thrown away.
+FACE_DET_MAX_EDGE = 1600
 
 # The opt-in aggressive pass, enabled by the preserveX2_ prefix. A lower threshold
 # than the raw passes use, because the faces it is there to catch score below what
@@ -972,11 +1024,46 @@ def clahe_for_detection(image_bgr):
     return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
 
+class _ScaledFace:
+    """A detection mapped back into the full-resolution image's coordinates.
+
+    InsightFace returns boxes and landmarks in the coordinates of whatever it was
+    given. When detection runs on a downscaled copy, everything downstream — the
+    mask, the descreening crops, the logged boxes — still works in the scan's own
+    coordinates, so the geometry is scaled back here rather than at each use.
+    """
+
+    __slots__ = ('bbox', 'kps', 'landmark_2d_106', 'det_score')
+
+    def __init__(self, face, inv_scale):
+        self.det_score = float(getattr(face, 'det_score', 0.0))
+        self.bbox = np.asarray(face.bbox, dtype=np.float32) * inv_scale
+        for attr in ('kps', 'landmark_2d_106'):
+            points = getattr(face, attr, None)
+            setattr(self, attr, None if points is None
+                    else np.asarray(points, dtype=np.float32) * inv_scale)
+
+
+def _detection_copy(image_bgr):
+    """(image, inverse_scale) for detection — downscaled to FACE_DET_MAX_EDGE."""
+    h, w = image_bgr.shape[:2]
+    if max(h, w) <= FACE_DET_MAX_EDGE:
+        return image_bgr, 1.0
+    scale = FACE_DET_MAX_EDGE / float(max(h, w))
+    resized = cv2.resize(image_bgr, (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+                         interpolation=cv2.INTER_AREA)
+    return resized, 1.0 / scale
+
+
 def detect_faces_multiscale(image_bgr, aggressive=False):
     """Run detection at every scale in FACE_DET_SIZES and merge the results.
 
     Different scales surface different faces, so the union is taken and then
     deduplicated by IoU, keeping the highest-scoring detection of each face.
+
+    Every pass runs on a copy capped at FACE_DET_MAX_EDGE, with the geometry scaled
+    back afterwards, because feeding the detector more pixels than it uses cost
+    accuracy rather than gaining it. See that constant for the measurements.
 
     Detection runs on the raw scan by default. `aggressive` adds a pass over a
     CLAHE-normalized copy at a lower threshold, which finds faces the raw passes
@@ -990,15 +1077,22 @@ def detect_faces_multiscale(image_bgr, aggressive=False):
     it. Each false positive freezes a small patch out of enhancement, which is a
     cheaper error than an AI-invented face but not one worth paying on every photo.
     """
+    work, inv_scale = _detection_copy(image_bgr)
+
     found = []
     for det_size in FACE_DET_SIZES:
-        for face in _get_face_analyzer(det_size).get(image_bgr):
+        for face in _get_face_analyzer(det_size).get(work):
             found.append(face)
 
     if aggressive:
         for face in _get_face_analyzer(FACE_DET_CLAHE_SIZE, FACE_DET_CLAHE_THRESH).get(
-                clahe_for_detection(image_bgr)):
+                clahe_for_detection(work)):
             found.append(face)
+
+    # Back into the caller's coordinates before dedupe, so IoU and every downstream
+    # use see the same frame of reference the image was passed in.
+    if inv_scale != 1.0:
+        found = [_ScaledFace(face, inv_scale) for face in found]
 
     # Highest confidence first, so the detection kept for each face is the best one.
     found.sort(key=lambda f: float(getattr(f, 'det_score', 0.0)), reverse=True)
@@ -1543,107 +1637,6 @@ def enhance_photo_pipeline(input_path: str, output_path: str, colorize: bool = F
 
 
 # ============================================================
-# TOPAZ ENHANCEMENT FUNCTION
-# ============================================================
-
-def enhance_with_topaz(input_path, output_path):
-    """Send a photo to Topaz Gigapixel (High Fidelity V2) for enhancement and save the result."""
-    print(f"  Sending to Topaz for enhancement...")
-
-    topaz_enhance_url = 'https://api.topazlabs.com/image/v1/enhance-gen/async'
-    topaz_status_url = 'https://api.topazlabs.com/image/v1/status'
-    topaz_download_url = 'https://api.topazlabs.com/image/v1/download'
-
-    headers = {'X-API-KEY': TOPAZ_API_KEY}
-    start_time = time.time()
-
-    with open(input_path, 'rb') as f:
-        response = requests.post(
-            topaz_enhance_url,
-            headers=headers,
-            files={'image': (os.path.basename(input_path), f, 'image/jpeg')},
-            data={
-                'model': 'Wonder 2',
-                'output_format': 'jpeg',
-                'prompt': TOPAZ_PROMPT,
-                'face_enhancement': 'false',  # Preserve faces as-is; true/false
-                'denoise': '1.0',             # Dust/scratch removal strength; range 0.0–1.0 (0=off, 1=maximum)
-                'creativity': '6',            # Reconstruction latitude; range 1–6 (1=conservative, 6=most generative)
-            },
-            timeout=60
-        )
-
-    if response.status_code != 200:
-        print(f"  ERROR: Topaz returned status {response.status_code}")
-        print(f"  Response: {response.text}")
-        return False
-
-    process_id = response.json().get('process_id')
-    if not process_id:
-        print(f"  ERROR: No process_id in Topaz response: {response.json()}")
-        return False
-
-    print(f"  Topaz job submitted (process_id: {process_id}). Waiting for completion...")
-
-    # Poll for completion (up to 10 minutes)
-    for attempt in range(120):
-        time.sleep(5)
-        status_response = requests.get(
-            f'{topaz_status_url}/{process_id}',
-            headers=headers,
-            timeout=30
-        )
-        if status_response.status_code != 200:
-            print(f"  ERROR: Failed to check Topaz status: {status_response.status_code}")
-            return False
-
-        status = status_response.json().get('status')
-        if status == 'Completed':
-            break
-        elif status == 'Failed':
-            print(f"  ERROR: Topaz enhancement job failed.")
-            print(f"  Response: {status_response.json()}")
-            return False
-        elif status == 'Cancelled':
-            print(f"  ERROR: Topaz enhancement job was cancelled.")
-            return False
-        # Still processing — keep polling
-
-    else:
-        print(f"  ERROR: Topaz enhancement timed out after 10 minutes.")
-        return False
-
-    elapsed = time.time() - start_time
-    print(f"  Topaz processing completed in {elapsed:.1f}s")
-
-    # Get the download URL from Topaz
-    download_response = requests.get(
-        f'{topaz_download_url}/{process_id}',
-        headers=headers,
-        timeout=30
-    )
-    if download_response.status_code != 200:
-        print(f"  ERROR: Failed to get Topaz download URL: {download_response.status_code}")
-        return False
-
-    image_url = download_response.json().get('download_url')
-    if not image_url:
-        print(f"  ERROR: No download_url in Topaz download response: {download_response.json()}")
-        return False
-
-    # Download the actual image from the URL
-    image_response = requests.get(image_url, timeout=120)
-    if image_response.status_code != 200:
-        print(f"  ERROR: Failed to download image from Topaz URL: {image_response.status_code}")
-        return False
-
-    with open(output_path, 'wb') as f:
-        f.write(image_response.content)
-
-    print(f"  Enhanced image saved: {os.path.basename(output_path)}")
-    return True
-
-# ============================================================
 # PROCESSING MODE (SELECTED BY FILENAME PREFIX)
 # ============================================================
 #
@@ -1653,14 +1646,18 @@ def enhance_with_topaz(input_path, output_path):
 # applied to everything. Rename a scan and drop it back in ~/Pictures to re-run it
 # a different way:
 #
-#   IMG_20260702_0015.jpg           xAI, unrestricted (default)
-#   preserve_IMG_20260702_0015.jpg  xAI, with the face-preserving pipeline
-#   topaz_IMG_20260702_0015.jpg     Topaz instead of xAI
+#   IMG_20260702_0015.jpg             xAI, faces unprotected (default)
+#   preserve_IMG_20260702_0015.jpg    xAI, with the face-preserving pipeline
+#   preserveX2_IMG_20260702_0015.jpg  the same, with aggressive face detection
 #
 # Every route writes the same output name, IMG_20260702_0015_ai.jpg.
+#
+# The same three routes are reachable without the watch folder, as --mode values on
+# --reprocess, which re-enhances a photo already on Drive. The default is the same
+# on both paths — no prefix and no --mode both mean xAI with faces unprotected — so
+# there is one rule to remember rather than one per entry point.
 
 MODE_PREFIXES = {
-    'topaz_': 'topaz',
     'preservex2_': 'preserve2',
     'preserve_': 'preserve',
 }
@@ -1680,6 +1677,180 @@ def split_mode_prefix(filename):
     return 'xai', filename
 
 
+# --mode spellings accepted on the command line, mapped onto the internal mode
+# names. 'preserveX2' is spelled as the filename prefix is, so there is one name
+# to remember per route rather than two.
+REPROCESS_MODES = {
+    'preserve': 'preserve',
+    'preservex2': 'preserve2',
+    'xai': 'xai',
+}
+
+
+def enhance_by_mode(src_path, dst_path, mode, is_bw, requested_by='filename prefix'):
+    """Enhance src into dst by processing mode. Returns True on success.
+
+    Shared by the watch-folder run and --reprocess so the routes cannot drift apart
+    between them. Every route sends the raw scan: median-filtering it first to
+    remove dust cost 74% of the input's fine detail to remove specks xAI strips
+    anyway, so no route pre-processes the image.
+    """
+    if mode in ('preserve', 'preserve2'):
+        aggressive = mode == 'preserve2'
+        print(f"  Using the face-preserving pipeline (requested via {requested_by})"
+              + ("  [aggressive detection]" if aggressive else ""))
+        return enhance_within_print_border(
+            src_path, dst_path,
+            lambda src, dst: enhance_photo_pipeline(src, dst, colorize=is_bw,
+                                                    aggressive=aggressive))
+
+    prompt = COLORIZE_PROMPT if is_bw else ENHANCEMENT_PROMPT
+    return enhance_within_print_border(
+        src_path, dst_path, lambda src, dst: enhance_with_xai(src, dst, prompt))
+
+
+# ============================================================
+# REPROCESSING A PHOTO ALREADY ON DRIVE
+# ============================================================
+#
+# Re-enhancing a photo used to mean downloading it, renaming it with a prefix,
+# dropping it in the watch folder, noting the old names, deleting the old files from
+# Drive, finding the new uploads under their new sequence number and renaming each
+# one back. All of that existed only because uploads could only ever create new
+# files. Replacing a file's content in place keeps its ID, name and created date, so
+# none of those steps are needed.
+
+ORIGINAL_NAME_RE = re.compile(r'^IMG_\d{8}_\d{4}\.jpe?g$', re.IGNORECASE)
+
+MODE_LABELS = {
+    'preserve': 'face-preserving pipeline',
+    'preserve2': 'face-preserving pipeline, aggressive detection',
+    'xai': 'xAI, faces unprotected',
+}
+
+
+def derivative_names(original_name):
+    """The enhancement filenames belonging to an original scan name."""
+    stem = re.sub(r'\.jpe?g$', '', original_name, flags=re.IGNORECASE)
+    return f'{stem}_ai.jpg', f'{stem}_bw_ai.jpg'
+
+
+def check_original_name(original_name):
+    """True if this is an original scan name. Explains itself when it isn't.
+
+    Called before Drive is authenticated, so a mistyped name costs nothing. The
+    derivatives are deliberately not accepted: they are found by convention from
+    the original, and taking one as input would make it ambiguous which file the
+    caller meant to be the source.
+    """
+    if ORIGINAL_NAME_RE.match(original_name):
+        return True
+    print(f"ERROR: --reprocess expects an original scan name, like IMG_20260422_0060.jpg")
+    if re.search(r'_(bw_)?ai\.jpe?g$', original_name, re.IGNORECASE):
+        suggested = re.sub(r'_(bw_)?ai(\.jpe?g)$', r'\2', original_name, flags=re.IGNORECASE)
+        print(f"  {original_name} is an enhancement, not an original.")
+        print(f"  Pass {suggested} instead — its enhancements are found and replaced for you.")
+    else:
+        print(f"  Got: {original_name}")
+    return False
+
+
+def reprocess_photo(service, folder_id, original_name, mode):
+    """Re-enhance a photo already on Drive, replacing its enhancements in place.
+
+    The original is read-only here and is never uploaded back. It is the source of
+    truth — already straightened by the run that first uploaded it — which is why
+    this path deliberately skips auto-orientation instead of giving it a second
+    chance to rotate an upright photo wrongly.
+
+    Nothing is written to Drive until the enhancement has succeeded locally, so a
+    failed run leaves the album exactly as it was. Returns True if Drive changed.
+    """
+    # main() checks this before authenticating; repeated here so the function is
+    # safe to call directly without the name having been vetted.
+    if not check_original_name(original_name):
+        return False
+
+    ai_name, bw_ai_name = derivative_names(original_name)
+
+    # Locate the original and its derivatives up front. Drive allows duplicate
+    # names in one folder, and overwriting the wrong half of an ambiguous pair is
+    # not something re-running can undo, so stop rather than guess.
+    found = find_drive_files(service, folder_id, original_name)
+    if not found:
+        print(f"ERROR: {original_name} is not in the album folder on Drive.")
+        return False
+    if len(found) > 1:
+        print(f"ERROR: {len(found)} files in the album are named {original_name}.")
+        print(f"  Remove the duplicates on Drive, then reprocess.")
+        return False
+    original = found[0]
+
+    derivatives = {}
+    for name in (ai_name, bw_ai_name):
+        matches = find_drive_files(service, folder_id, name)
+        if len(matches) > 1:
+            print(f"ERROR: {len(matches)} files in the album are named {name}.")
+            print(f"  Remove the duplicates on Drive, then reprocess.")
+            return False
+        derivatives[name] = matches[0] if matches else None
+
+    # Printed before the API call, so the route is visible before anything is spent
+    # on it and before the enhancement that is about to be superseded is replaced.
+    print(f"Reprocessing {original_name}")
+    print(f"  Route: {MODE_LABELS.get(mode, mode)}")
+
+    # Everything local happens outside SCANNER_OUTPUT. A download into the watch
+    # folder could be picked up by the launchd job mid-flight, producing a second
+    # concurrent run of the same photo that then deletes the file locally.
+    work_dir = tempfile.mkdtemp(prefix='photo-scanner-reprocess-')
+    try:
+        local_original = os.path.join(work_dir, original_name)
+        print(f"  Downloading the original from Drive...")
+        download_from_drive(service, original['id'], local_original)
+
+        if cv2.imread(local_original) is None:
+            print(f"ERROR: the downloaded original could not be decoded as an image.")
+            print(f"  Nothing on Drive was changed.")
+            return False
+
+        is_bw = is_black_and_white(local_original)
+        if is_bw:
+            print(f"  Detected as black & white image")
+
+        local_ai = os.path.join(work_dir, ai_name)
+        if not enhance_by_mode(local_original, local_ai, mode, is_bw,
+                               requested_by='--mode'):
+            print(f"  WARNING: enhancement failed. Nothing on Drive was changed.")
+            return False
+
+        pending = [(ai_name, local_ai)]
+
+        if is_bw:
+            local_bw_ai = os.path.join(work_dir, bw_ai_name)
+            Image.open(local_ai).convert('L').save(local_bw_ai)
+            print(f"  Created B&W version: {bw_ai_name}")
+            pending.append((bw_ai_name, local_bw_ai))
+        elif derivatives[bw_ai_name]:
+            print(f"  NOTE: {bw_ai_name} is on Drive, but this original reads as colour.")
+            print(f"  Leaving it alone — delete it by hand if it is stale.")
+
+        # Only now does anything reach Drive, and only the derivatives.
+        for name, path in pending:
+            existing = derivatives[name]
+            if existing:
+                replace_on_drive(service, existing['id'], path)
+            else:
+                print(f"  {name} was missing from the album; creating it.")
+                upload_to_drive(service, path, name, folder_id)
+
+        print(f"\nDone. {original_name} was reprocessed and the original left unmodified.")
+        print(f"The previous enhancement stays in Drive's version history for 30 days.")
+        return True
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 # ============================================================
 # CONFIG HANDLING
 # ============================================================
@@ -1688,14 +1859,16 @@ def load_config_file():
     """Load settings from ~/.photo-scanner-config.json.
 
     Returns the parsed config dict, or an empty dict if the file doesn't exist.
-    API keys in the config file take precedence over environment variables.
+    The API key in the config file takes precedence over the environment variable.
+
+    An unrecognised key in the config file is ignored rather than rejected, so a
+    leftover 'topaz_api_key' from when this script supported Topaz does no harm.
     """
-    global TOPAZ_API_KEY, XAI_API_KEY
+    global XAI_API_KEY
 
     config_path = os.path.expanduser('~/.photo-scanner-config.json')
 
-    # Start with environment variables as the baseline
-    TOPAZ_API_KEY = os.environ.get('TOPAZ_API_KEY')
+    # Start with the environment variable as the baseline
     XAI_API_KEY = os.environ.get('XAI_API_KEY')
 
     if not os.path.exists(config_path):
@@ -1704,9 +1877,7 @@ def load_config_file():
         with open(config_path, 'r') as f:
             config = json.load(f)
 
-        # Config file values override environment variables
-        if config.get('topaz_api_key'):
-            TOPAZ_API_KEY = config['topaz_api_key']
+        # Config file value overrides the environment variable
         if config.get('xai_api_key'):
             XAI_API_KEY = config['xai_api_key']
 
@@ -1722,9 +1893,23 @@ def load_config_file():
 def main():
     parser = argparse.ArgumentParser(description='Scan, enhance, and upload photos to Google Drive.')
     parser.add_argument('--folder-id', required=False, help='Google Drive folder ID for the current album')
+    parser.add_argument('--reprocess', metavar='FILENAME', required=False,
+                        help='Re-enhance a photo already on Drive, replacing its _ai '
+                             'files in place. Takes the original scan name, e.g. '
+                             'IMG_20260422_0060.jpg')
+    parser.add_argument('--mode', type=str.lower, choices=sorted(REPROCESS_MODES),
+                        required=False,
+                        help="Processing route for --reprocess (default: xai, which "
+                             "leaves faces unprotected, as an unprefixed scan does). "
+                             "'preserve' protects faces; 'preservex2' is its "
+                             "aggressive-detection variant.")
     args = parser.parse_args()
 
-    # Load config file (also sets TOPAZ_API_KEY and XAI_API_KEY globals)
+    if args.mode and not args.reprocess:
+        print("WARNING: --mode only applies to --reprocess. Photos in the watch folder "
+              "choose their route by filename prefix, so this flag is being ignored.\n")
+
+    # Load config file (also sets the XAI_API_KEY global)
     config = load_config_file()
 
     # Use CLI parameter if provided, otherwise fall back to config file
@@ -1736,19 +1921,28 @@ def main():
         print(f"\nUsage:")
         print("  python photo_scanner.py --folder-id <DRIVE_FOLDER_ID>")
         print(f"\nOr add it to the config file at: {config_path}")
-        print('  { "folder_id": "<DRIVE_FOLDER_ID>", "topaz_api_key": "...", "xai_api_key": "..." }')
+        print('  { "folder_id": "<DRIVE_FOLDER_ID>", "xai_api_key": "..." }')
         return
 
-    # xAI handles every route except topaz_, so its key is what a run actually needs.
-    # This used to check TOPAZ_API_KEY instead, which blocked anyone without a Topaz
-    # account from running at all while letting a missing xAI key through to fail as
-    # an opaque 401 mid-run, after files had already been renamed. The Topaz key is
-    # now checked lazily, only when a topaz_ file is about to be processed, so neither
-    # key is required unless it is used.
+    # xAI handles every route, so its key is what a run actually needs. This used to
+    # check a Topaz key instead, which blocked anyone without a Topaz account from
+    # running at all while letting a missing xAI key through to fail as an opaque 401
+    # mid-run, after files had already been renamed.
     if not XAI_API_KEY:
         print("ERROR: XAI_API_KEY not found in config file or environment variables.")
         print("Add 'xai_api_key' to ~/.photo-scanner-config.json or set the XAI_API_KEY environment variable.")
         return
+
+    # --reprocess works entirely against Drive and never reads the watch folder, so
+    # it returns here rather than falling through to the scan-discovery steps.
+    if args.reprocess:
+        # Validate the name before authenticating, so a typo doesn't cost a round
+        # trip to Drive before it is reported.
+        if not check_original_name(args.reprocess):
+            return 1
+        service = authenticate_drive()
+        mode = REPROCESS_MODES[args.mode] if args.mode else 'xai'
+        return 0 if reprocess_photo(service, folder_id, args.reprocess, mode) else 1
 
     # Step 1: Any JPEG in the scan folder is a photo to process.
     #
@@ -1767,10 +1961,12 @@ def main():
     ]
     local_files = sorted(set(f for p in patterns for f in glob.glob(p)))
 
-    # Filter out any _ai, _dr (dust-removal temp), or _stage2_ (pipeline temp) files
-    # that might be lingering from an interrupted run
+    # Filter out any _ai or _stage2_ (pipeline temp) files lingering from an
+    # interrupted run. Both are still produced by live code; _dr. used to be
+    # excluded here too, for the dust-removal temporaries of the Topaz route, but
+    # nothing can create one any more. Since any .jpg is now accepted as a photo,
+    # keeping that pattern would silently skip a real scan called portrait_dr.jpg.
     local_files = [f for f in local_files if '_ai.' not in os.path.basename(f).lower()
-                   and '_dr.' not in os.path.basename(f).lower()
                    and '_stage2_' not in os.path.basename(f).lower()]
 
     # Remove duplicates
@@ -1819,7 +2015,7 @@ def main():
     # prefix says how the photo should be processed, not that it is a re-run of one
     # already numbered on Drive. Prefixed files used to skip this and keep their own
     # number, which silently collided when a fresh scan was dropped in as
-    # topaz_IMG_..._0001 while 0001 and 0002 already existed on Drive.
+    # preserve_IMG_..._0001 while 0001 and 0002 already existed on Drive.
     #
     # Counter-style names (IMG00001.JPG) carry no date and no Drive sequence, so they
     # are always renumbered onto today's date rather than kept.
@@ -1905,41 +2101,11 @@ def main():
         if is_bw:
             print(f"  Detected as black & white image")
 
-        # Route according to the filename prefix. Unrestricted xAI is the default
+        # Route according to the filename prefix. Faces unprotected is the default
         # because it gives the best results on most photos; the masked pipeline is
         # the remedy for the ones where xAI reworks faces past recognition.
         ai_path = os.path.join(SCANNER_OUTPUT, ai_filename)
-        prompt = COLORIZE_PROMPT if is_bw else ENHANCEMENT_PROMPT
-
-        if mode == 'topaz' and not TOPAZ_API_KEY:
-            # Checked here rather than at startup so an xAI-only setup can run.
-            print(f"  ERROR: TOPAZ_API_KEY not found, but this file requests Topaz.")
-            print(f"  Add 'topaz_api_key' to ~/.photo-scanner-config.json, or remove "
-                  f"the topaz_ prefix to use xAI instead.")
-            failed_files.append(new_filename)
-            print()
-            continue
-
-        if mode == 'topaz':
-            # Topaz is the only route that gets dust removal, and it runs first.
-            dust_removed_path = new_path.replace('.jpg', '_dr.jpg').replace('.JPG', '_dr.jpg')
-            print(f"  Applying dust removal (MedianFilter size=3)...")
-            apply_dust_removal(new_path, dust_removed_path)
-            print(f"  Using Topaz (requested via filename prefix)")
-            success = enhance_with_topaz(dust_removed_path, ai_path)
-            if os.path.exists(dust_removed_path):
-                os.remove(dust_removed_path)
-        elif mode in ('preserve', 'preserve2'):
-            aggressive = mode == 'preserve2'
-            print(f"  Using the face-preserving pipeline (requested via filename prefix)"
-                  + ("  [aggressive detection]" if aggressive else ""))
-            success = enhance_within_print_border(
-                new_path, ai_path,
-                lambda src, dst: enhance_photo_pipeline(src, dst, colorize=is_bw,
-                                                        aggressive=aggressive))
-        else:
-            success = enhance_within_print_border(
-                new_path, ai_path, lambda src, dst: enhance_with_xai(src, dst, prompt))
+        success = enhance_by_mode(new_path, ai_path, mode, is_bw)
 
         if success:
             # Upload both the original and enhanced version to Drive
@@ -1980,4 +2146,6 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    # main() returns a code only on the --reprocess path, so a failed reprocess is
+    # visible to a shell. Every other path returns None, which exits 0 as before.
+    sys.exit(main())
