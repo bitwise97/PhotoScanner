@@ -19,14 +19,15 @@ How a photo is processed is chosen by its filename prefix. Rename a scan and dro
 
 | Input filename | Processed by |
 |---|---|
-| `IMG_20260702_0015.jpg` | xAI, unrestricted (default) |
+| `IMG_20260702_0015.jpg` | xAI, faces unprotected (default) |
 | `preserve_IMG_20260702_0015.jpg` | xAI, with the face-preserving pipeline |
 | `preserveX2_IMG_20260702_0015.jpg` | the same, with aggressive face detection |
-| `topaz_IMG_20260702_0015.jpg` | Topaz instead of xAI |
 
-Unrestricted xAI is the default because it gives the best results on most photos — it reconstructs detail and repairs damage freely. On some photos it reworks faces until people are no longer recognisable, and `preserve_` is the remedy for those.
+The same three routes are available as `--mode` values on `--reprocess`, for a photo that is already on Drive. The default is the same on both paths — no prefix and no `--mode` both mean unprotected xAI — so there is one rule to remember rather than one per entry point.
 
-The prefix says only *how* to process the photo. It goes in front of whatever the file is already called — `topaz_IMG_9445.JPG` works as well as `topaz_IMG_20260702_0015.jpg` — and prefixed files are renumbered on sequence conflict exactly like unprefixed ones, so a prefix works equally well on a fresh scan or on a re-run of one you weren't happy with.
+Leaving faces unprotected is the default because it gives the best results on most photos — it reconstructs detail and repairs damage freely. On some photos it reworks faces until people are no longer recognisable, and `preserve_` is the remedy for those.
+
+The prefix says only *how* to process the photo. It goes in front of whatever the file is already called — `preserve_IMG_9445.JPG` works as well as `preserve_IMG_20260702_0015.jpg` — and prefixed files are renumbered on sequence conflict exactly like unprefixed ones, so a prefix works equally well on a fresh scan or on a re-run of one you weren't happy with.
 
 ### The face-preserving pipeline
 
@@ -40,6 +41,16 @@ The prefix says only *how* to process the photo. It goes in front of whatever th
 `FACE_XAI_LUMA_BLEND` controls the split, and defaults to `0.0` — facial detail entirely from your scan. It ran at `0.30` for a while, on the theory that a little of xAI's luminance would lift the scan's own grain and softness, but on badly faded scans that share was visible as enhancement bleeding into faces, which is the thing the mask exists to prevent. Raise it toward `0.10`–`0.15` if faces read as too rough against a reconstructed background.
 
 Two related constants shape the mask itself: `FACE_HULL_DILATE_RATIO` (`0.04`) grows the outline outward from the detected landmarks, and `FACE_FEATHER_RATIO` (`0.01`) sets the width of the soft transition ring just outside it. Shrinking them trades overspill around the face for leakage at its edges — too tight and a hairline or jaw falls outside the mask and gets enhanced, which is subtle because it shows at the edges of a face rather than across it.
+
+### Detection resolution
+
+Faces are detected on a copy of the scan capped at `FACE_DET_MAX_EDGE` (`1600`) on the long edge, and the boxes and landmarks are scaled back afterwards. More resolution made detection *worse*, not better.
+
+The detector never looks at more than the largest entry in `FACE_DET_SIZES`, which is also 1600 — it resizes internally. Handing it a 4717×5400 scan meant that resize threw away 3.4× the pixels, and on a grainy print it aliased grain into structure that read as facial texture. On one 1970s photograph of three people it masked a man's belly, his forearm and a woman's knees alongside the three real faces. Downscaling first with `INTER_AREA`, which averages the grain rather than sampling through it, gives the detector the same size image without that artefact.
+
+Measured across 12 real scans and 52 detections: false positives fell from 5 to 2, and the gap between the lowest real face and the highest false positive widened from 0.06 to 0.16, with all 12 real faces still found. On the photograph above, 7 detections became 4. An infant's face that scored 0.51 at full resolution scored 0.54 downscaled — the marginal real faces gained headroom rather than losing it.
+
+Boosting contrast beforehand was tried and is worse. Grey-world white balance took the same photograph from 5 false positives to 9, and a percentile contrast stretch to 7; both pushed the highest false positive *above* the lowest real face, so no threshold could separate them. Lifting contrast on a faded, grainy scan amplifies exactly the grain that creates the problem. CLAHE fares better and is still what `preserveX2` uses, but on its own it narrowed the margin too.
 
 ### When a face is missed entirely
 
@@ -66,8 +77,7 @@ The enhanced file comes back at whatever resolution xAI produces — currently c
 - Python — developed and tested on 3.13
 - A Google Cloud project with the **Google Drive API** enabled
 - OAuth 2.0 credentials downloaded from the Google Cloud Console
-- An **xAI API key** — required, this is the default enhancer, and checked at startup
-- A **Topaz API key** — only needed if you use the `topaz_` prefix
+- An **xAI API key** — required, this is the only enhancer, and checked at startup
 - **launchctl** (macOS) configured to watch the scan folder and trigger the script, if you want it to run automatically
 
 On first run, InsightFace downloads its face-detection models — about a 280MB download, occupying roughly 600MB in `~/.insightface` once unpacked. This happens once.
@@ -87,7 +97,6 @@ pip install -r requirements.txt
    ```json
    {
      "folder_id": "your_google_drive_folder_id",
-     "topaz_api_key": "your_topaz_api_key",
      "xai_api_key": "your_xai_api_key"
    }
    ```
@@ -113,6 +122,28 @@ The config file is the recommended approach and the only one that works under la
 
 (`~` is your home directory. To show hidden files in Finder, press `Cmd + Shift + .`)
 
+### Reprocessing a photo already on Drive
+
+To re-enhance a photo that's already uploaded, pass its original scan name:
+
+```bash
+python photo_scanner.py --reprocess IMG_20260422_0060.jpg --mode preserve
+```
+
+This downloads the original from Drive, enhances it again, and replaces `IMG_20260422_0060_ai.jpg` — and `_bw_ai.jpg` if the photo is black & white — **in place**. Because the content of the existing file is replaced rather than a new file created, each one keeps its file ID, its name and its creation date, so nothing is renamed, nothing is renumbered, share links keep working, and a reprocessed 1970s photo doesn't jump to the end of an album sorted by date added.
+
+A few deliberate choices:
+
+- **The original is never written to.** It's downloaded read-only and used as the source. It is the thing that makes a reprocess repeatable, so nothing in this path can modify it.
+- **Auto-orientation is skipped.** The photo on Drive was straightened when it was first processed, so re-running orientation detection would only give it a second chance to rotate an upright photo wrongly.
+- **Nothing reaches Drive until the enhancement has succeeded locally.** A failed enhancement, or a failed face verification, leaves the album exactly as it was.
+- **The previous enhancement stays recoverable for 30 days** in Drive's own version history ("Manage versions" on the file), after which Drive purges it automatically. The script never deletes those revisions — letting them expire on their own is what makes a reprocess undoable at no lasting storage cost.
+- **Only the original filename is accepted.** Passing `IMG_x_ai.jpg` is rejected with a note telling you which name to use; the derivatives are found by convention. Filenames with a letter suffix are supported — `IMG_20260422_0060b.jpg` is valid.
+- **Ambiguity stops the run.** Drive allows two files with the same name in one folder, and overwriting the wrong one isn't undoable by re-running, so a duplicated name aborts before anything is written.
+- Work happens in a temp directory, never in the watch folder, so the launchd job can't pick up the download mid-flight and process the same photo a second time.
+
+`--mode` accepts `xai` (default), `preserve` and `preservex2`. The route in use is printed before the API call. A failed reprocess exits non-zero.
+
 ## Notes and Behaviour
 
 **Enhancement model.** Uses `grok-imagine-image-quality-latest`. The standard `grok-imagine-image` model is markedly weaker — on the same scan with the same prompt it produced roughly a fifth of the fine detail. `XAI_MODEL` near the top of the script documents all three options.
@@ -121,7 +152,7 @@ The config file is the recommended approach and the only one that works under la
 
 **Print borders** are preserved exactly. A scan with a white or cream paper border is detected, the border is cropped off before the photo goes to xAI, and the enhanced photo is pasted back inside the scan's own border afterwards — including rounded corners, and the paper wedge left by a print scanned slightly askew. xAI never sees the border, because when it did, it outpainted into it: told in the prompt to leave the margin alone, it invented the top of a figure in a painting that the border had cut off. A border is only recognised when all four sides have one, so an overcast sky or a pale band along one edge isn't mistaken for paper.
 
-**Dust removal** runs only on the Topaz route. Median-filtering a scan costs about 74% of its fine detail to remove dust that xAI strips anyway, so the xAI routes send the raw scan untouched.
+**No pre-processing.** Every route sends the raw scan. Median-filtering it first to remove dust cost about 74% of its fine detail to remove specks xAI strips anyway, so that step was removed along with the Topaz route that used it.
 
 **Black & white detection** switches the prompt from restoration to colorization. Detection triggers below an average saturation of 10, so a heavily sepia-toned print may be treated as a colour photo.
 
@@ -146,13 +177,15 @@ The config file is the recommended approach and the only one that works under la
 python tests/run_all.py
 ```
 
-36 cases, running in about a second, needing no API keys, no network, and no Google Drive access. Google Drive, both enhancement APIs and auto-orientation are stubbed out, and scans are generated into a temp directory — but the genuine `main()` runs, so the tests exercise the real filename sequencing, prefix routing and key-validation code rather than a copy of it. Exits non-zero if anything fails.
+65 cases, running in about two seconds, needing no API keys, no network, and no Google Drive access. Google Drive, the xAI enhancement API and auto-orientation are stubbed out, and scans are generated into a temp directory — but the genuine `main()` runs, so the tests exercise the real filename sequencing, prefix routing, key-validation and reprocessing code rather than a copy of it. Exits non-zero if anything fails.
 
-Every case covers a bug that reached production:
+Most cases cover a bug that reached production:
 
 - Prefixed files skipping the sequence-conflict check and colliding with files already on Drive
 - Counter-style names never being renamed, so they uploaded under the scanner's own filename
 - An unrecognised filename aborting the entire run rather than skipping one photo
-- API-key validation requiring the Topaz key while never checking the xAI one
+- API-key validation requiring a second service's key while never checking the xAI one
 - xAI outpainting into a print's paper border, invented content and all
 - The rename cascade that destroyed scans — checked by hashing the bytes each upload actually sends, since the filenames were all correct and only the images behind them were duplicated
+
+The `--reprocess` cases are the exception: that path is new, so they fix its invariants rather than recording past failures. They assert the negatives — that the original is never written to, that a duplicated name aborts before any write, and that a failed enhancement reaches Drive with nothing at all — and each was checked by deliberately reintroducing the bug it describes and confirming the right case fails.
