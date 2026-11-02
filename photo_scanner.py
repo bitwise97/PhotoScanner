@@ -1720,7 +1720,7 @@ def enhance_by_mode(src_path, dst_path, mode, is_bw, requested_by='filename pref
 # files. Replacing a file's content in place keeps its ID, name and created date, so
 # none of those steps are needed.
 
-ORIGINAL_NAME_RE = re.compile(r'^IMG_\d{8}_\d{4}\.jpe?g$', re.IGNORECASE)
+ORIGINAL_NAME_RE = re.compile(r'^IMG_\d{8}_\d{4}[a-z]?\.jpe?g$', re.IGNORECASE)
 
 MODE_LABELS = {
     'preserve': 'face-preserving pipeline',
@@ -1745,7 +1745,7 @@ def check_original_name(original_name):
     """
     if ORIGINAL_NAME_RE.match(original_name):
         return True
-    print(f"ERROR: --reprocess expects an original scan name, like IMG_20260422_0060.jpg")
+    print(f"ERROR: --reprocess expects an original scan name, like IMG_20260422_0060.jpg or IMG_20260422_0060b.jpg")
     if re.search(r'_(bw_)?ai\.jpe?g$', original_name, re.IGNORECASE):
         suggested = re.sub(r'_(bw_)?ai(\.jpe?g)$', r'\2', original_name, flags=re.IGNORECASE)
         print(f"  {original_name} is an enhancement, not an original.")
