@@ -140,7 +140,7 @@ XAI_API_KEY = None
 # This model choice was the reason manual grok.com uploads looked dramatically
 # better than this script's output. Prompt wording and dust-removal pre-processing
 # were each tested first and neither made a visible difference; the model did.
-XAI_MODEL = 'grok-imagine-image-quality-latest'  # switch to grok-imagine-image-2.0 once xAI grants team access
+XAI_MODEL = 'grok-imagine-image-2.0'
 XAI_QUALITY = 'auto'  # auto = highest quality tier; low/medium/high also accepted (used with grok-imagine-image-2.0)
 
 # xAI enhancement prompt.
@@ -857,6 +857,12 @@ FACE_FEATHER_RATIO = 0.01       # width of the soft transition ring OUTSIDE the 
 FACE_DET_SIZES = (640, 1024, 1600)
 FACE_DET_THRESH = 0.3           # below the 0.5 default; false positives are the cheap error
 FACE_DEDUPE_IOU = 0.4           # boxes overlapping more than this are the same face
+FACE_DET_MIN_SCORE = 0.50       # post-dedupe confidence floor; drops weak detections the raw
+                                # threshold admits but that are unlikely to be real faces
+FACE_DET_MAX_AREA_FRAC = 0.15   # post-dedupe size cap; a bounding box covering more than this
+                                # fraction of the image is almost certainly a false positive
+                                # (15% = a face filling ~39% of width on each axis, which is
+                                # larger than any face in a normal group photo)
 
 # Detection runs on a copy no larger than this on the long edge. The detector never
 # looks at more than max(FACE_DET_SIZES) anyway — it resizes internally — so handing
@@ -1102,7 +1108,21 @@ def detect_faces_multiscale(image_bgr, aggressive=False):
         box = [int(v) for v in face.bbox]
         if all(_iou(box, [int(v) for v in kept.bbox]) <= FACE_DEDUPE_IOU for kept in merged):
             merged.append(face)
-    return merged
+
+    image_area = image_bgr.shape[0] * image_bgr.shape[1]
+    filtered = []
+    for face in merged:
+        score = float(getattr(face, 'det_score', 0.0))
+        x1, y1, x2, y2 = [int(v) for v in face.bbox]
+        face_area_frac = (x2 - x1) * (y2 - y1) / image_area
+        if score < FACE_DET_MIN_SCORE:
+            print(f"    dropped low-confidence detection (score {score:.2f} < {FACE_DET_MIN_SCORE})")
+            continue
+        if face_area_frac > FACE_DET_MAX_AREA_FRAC:
+            print(f"    dropped oversized detection ({face_area_frac:.1%} of image > {FACE_DET_MAX_AREA_FRAC:.0%} cap)")
+            continue
+        filtered.append(face)
+    return filtered
 
 
 def _odd(n):
